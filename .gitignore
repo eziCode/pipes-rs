@@ -1,0 +1,8 @@
+# Downloaded datasets and generated analysis artifacts
+/data/
+/graphify-out/
+
+# Python tooling
+__pycache__/
+*.py[cod]
+.venv/

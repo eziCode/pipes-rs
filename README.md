@@ -57,3 +57,28 @@ fusion algorithm or from data arriving late or going missing.
 simulation playground. It can generate repeatable sensor workloads for Pipes,
 but neither project depends on the other.
 
+## Download a small Waymo sample
+
+The sample downloader fetches the camera and LiDAR components for one or two
+20-second Waymo Open Dataset v2 segments. Accept the
+[Waymo Open Dataset terms](https://waymo.com/open/terms/), authenticate with
+`gcloud auth login`, and use the same Google account for both steps.
+
+Preview the download without transferring data:
+
+```bash
+python3 scripts/download_waymo_sample.py --dry-run
+```
+
+Download one segment, including camera and LiDAR boxes for evaluation:
+
+```bash
+python3 scripts/download_waymo_sample.py \
+  --with-labels
+```
+
+Pass `--count 2` to download both sample segments. Data is written under
+`data/waymo-v2-sample/`, which is ignored by Git. If your Cloud Storage setup
+requires a quota project, pass `--billing-project YOUR_GCP_PROJECT`. If
+`gcloud storage` reports a broken local CRC32C checksum, retry with
+`--transfer-tool gsutil`.
