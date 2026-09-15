@@ -2,8 +2,8 @@
 
 # Multi-architecture index digests freeze both image content and the mapping
 # from TARGETPLATFORM to its platform-specific image.
-ARG RUST_IMAGE=rust:1.94.0-bookworm@sha256:365468470075493dc4583f47387001854321c5a8583ea9604b297e67f01c5a4f
-ARG RUNTIME_IMAGE=debian:bookworm-slim@sha256:88200866dfff7ea7f5cbcb6ec7c8a701889efe6fe859fe64d6990e4b07ea4171
+ARG RUST_IMAGE=rust:1.94.0-trixie@sha256:f17e723020f87c1b4ac4ff6d73c9dfbb7d5cb978754c76641e47337d65f61e12
+ARG RUNTIME_IMAGE=debian:trixie-slim@sha256:d7e12182ce18b85b93007c1dedf31f2d29e01ccf3182cc4017c709b6259bc132
 
 FROM ${RUST_IMAGE} AS builder
 WORKDIR /build
@@ -17,6 +17,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     && rm -rf src
 
 COPY src ./src
+COPY assets ./assets
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/build/target \
     touch src/main.rs \

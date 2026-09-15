@@ -131,6 +131,56 @@ Subsequent frames can be selected with `--frame-index`. Per-pixel LiDAR motion
 compensation and model-produced camera detections are intentionally deferred to
 the next milestone.
 
+## Run the staged perception workload
+
+The multi-frame workload runs camera JPEG decoding and top-LiDAR conversion on
+separate worker threads connected to bounded channels. A synchronization stage
+matches timestamps, fuses projected LiDAR depth into detections, and records one
+CSV row per frame:
+
+```bash
+cargo run --release -- \
+  --segment 10023947602400723454_1120_000_1140_000 \
+  --stage-queue-size 4 \
+  --perception-csv demo-output/perception.csv
+```
+
+Use `--frame-limit 10` for a short smoke test; the default processes the entire
+segment. Metrics include camera decode time, LiDAR-to-Arrow conversion time,
+both queue waits, timestamp skew, fusion time, end-to-end time, point count,
+detection count, and depth-match count. Camera pixels are genuinely JPEG
+decoded and checksummed. Without `--onnx-model`, detections come from Waymo
+ground truth to provide a deterministic performance and correctness baseline.
+
+Download the official 416×416 YOLOX-Nano ONNX model and run real inference:
+
+```bash
+./scripts/download_yolox_model.sh
+
+cargo run --release -- \
+  --segment 10023947602400723454_1120_000_1140_000 \
+  --onnx-model models/yolox_nano.onnx \
+  --confidence-threshold 0.3 \
+  --nms-threshold 0.45 \
+  --perception-csv demo-output/perception-onnx.csv
+```
+
+YOLOX predictions are emitted as Arrow detection batches, fused with LiDAR,
+and evaluated against Waymo boxes at IoU 0.5. The CSV includes inference time,
+true positives, false positives, false negatives, and the existing pipeline
+timings. COCO `person`, `bicycle`/`motorcycle`, `car`/`bus`/`truck`, and
+`stop sign` predictions map to the corresponding Waymo categories.
+
+Run the same full workload inside the constrained benchmark container with:
+
+```bash
+./scripts/run_container_benchmark.sh perception perception-01
+./scripts/run_container_benchmark.sh perception-onnx perception-onnx-01
+```
+
+Its frame-level output is written to
+`benchmark-results/<scenario>/<run-id>/perception.csv`.
+
 ## Reproducible container benchmarks
 
 The benchmark container bakes in the release binary and runs without network

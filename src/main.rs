@@ -1,3 +1,4 @@
+mod detector;
 mod fusion;
 mod measurement;
 mod metrics;
@@ -70,6 +71,28 @@ struct Args {
     /// Zero-based front-camera frame used by --demo-output.
     #[arg(long, default_value_t = 0)]
     frame_index: usize,
+
+    /// Run the full staged camera/LiDAR perception workload and write frame metrics.
+    #[arg(long)]
+    perception_csv: Option<PathBuf>,
+
+    /// Stop a perception run after this many frames; 0 processes the whole segment.
+    #[arg(long, default_value_t = 0)]
+    frame_limit: usize,
+
+    /// Capacity of each processing-stage channel.
+    #[arg(long, default_value_t = 4)]
+    stage_queue_size: usize,
+
+    /// YOLOX ONNX model. When omitted, Waymo labels provide the validation baseline.
+    #[arg(long)]
+    onnx_model: Option<PathBuf>,
+
+    #[arg(long, default_value_t = 0.3)]
+    confidence_threshold: f32,
+
+    #[arg(long, default_value_t = 0.45)]
+    nms_threshold: f32,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -89,6 +112,57 @@ impl From<PolicyArg> for QueuePolicy {
 
 fn main() -> Result<()> {
     let args = Args::parse();
+
+    if let Some(output) = &args.perception_csv {
+        anyhow::ensure!(
+            args.stage_queue_size > 0,
+            "--stage-queue-size must be at least 1"
+        );
+        let summary = fusion::run_segment_pipeline(
+            &args.data_root,
+            &args.split,
+            &args.segment,
+            fusion::PerceptionConfig {
+                frame_limit: args.frame_limit,
+                queue_size: args.stage_queue_size,
+                onnx_model: args.onnx_model.as_deref(),
+                confidence: args.confidence_threshold,
+                nms: args.nms_threshold,
+            },
+            output,
+        )?;
+        println!(
+            "perception: frames={} points={} detections={} depth_matched={} elapsed={:.2}s rate={:.2}Hz",
+            summary.frames,
+            summary.points,
+            summary.detections,
+            summary.depth_matched,
+            summary.elapsed.as_secs_f64(),
+            summary.frames as f64 / summary.elapsed.as_secs_f64().max(f64::EPSILON),
+        );
+        let precision = summary.true_positives as f64
+            / (summary.true_positives + summary.false_positives).max(1) as f64;
+        let recall = summary.true_positives as f64
+            / (summary.true_positives + summary.false_negatives).max(1) as f64;
+        println!(
+            "evaluation@IoU0.5: tp={} fp={} fn={} precision={:.3} recall={:.3}",
+            summary.true_positives,
+            summary.false_positives,
+            summary.false_negatives,
+            precision,
+            recall
+        );
+        println!("frame metrics: {}", output.display());
+        println!(
+            "detection source: {}",
+            if args.onnx_model.is_some() {
+                "YOLOX ONNX predictions"
+            } else {
+                "Waymo ground truth"
+            }
+        );
+        return Ok(());
+    }
 
     if let Some(output) = &args.demo_output {
         let summary = fusion::build_demo(

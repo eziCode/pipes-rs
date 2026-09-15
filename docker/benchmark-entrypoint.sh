@@ -7,7 +7,7 @@ segment="${SEGMENT:-10023947602400723454_1120_000_1140_000}"
 split="${SPLIT:-training}"
 
 case "$scenario" in
-  realtime|burst-drop|burst-backpressure|overloaded) ;;
+  realtime|burst-drop|burst-backpressure|overloaded|perception|perception-onnx) ;;
   *) echo "unknown scenario: $scenario" >&2; exit 2 ;;
 esac
 
@@ -34,7 +34,16 @@ mkdir -p "$result_dir"
 
 camera_file="/data/waymo-v2-sample/$split/camera_image/$segment.parquet"
 lidar_file="/data/waymo-v2-sample/$split/lidar/$segment.parquet"
-for input in "$camera_file" "$lidar_file"; do
+inputs="$camera_file $lidar_file"
+if [ "$scenario" = perception ] || [ "$scenario" = perception-onnx ]; then
+  inputs="$inputs /data/waymo-v2-sample/$split/lidar_camera_projection/$segment.parquet"
+  inputs="$inputs /data/waymo-v2-sample/$split/lidar_calibration/$segment.parquet"
+  inputs="$inputs /data/waymo-v2-sample/$split/camera_box/$segment.parquet"
+fi
+if [ "$scenario" = perception-onnx ]; then
+  inputs="$inputs /models/yolox_nano.onnx"
+fi
+for input in $inputs; do
   if [ ! -r "$input" ]; then
     echo "missing benchmark input: $input" >&2
     exit 2
@@ -43,22 +52,29 @@ done
 
 # Hashing verifies the exact input and intentionally warms both files before
 # every timed run, avoiding a cold-cache/warm-cache difference between repeats.
-sha256sum "$camera_file" "$lidar_file" > "$result_dir/input.sha256"
+sha256sum $inputs > "$result_dir/input.sha256"
 
-case "$scenario" in
-  realtime)
-    set -- --speed 1 --queue-size 8 --queue-policy drop-oldest
-    ;;
-  burst-drop)
-    set -- --speed 0 --queue-size 8 --queue-policy drop-oldest
-    ;;
-  burst-backpressure)
-    set -- --speed 0 --queue-size 8 --queue-policy backpressure
-    ;;
-  overloaded)
-    set -- --speed 1 --queue-size 8 --queue-policy drop-oldest --lidar-work-ms 125
-    ;;
-esac
+if [ "$scenario" = perception ]; then
+  set -- --stage-queue-size 4 --perception-csv "$result_dir/perception.csv"
+elif [ "$scenario" = perception-onnx ]; then
+  set -- --stage-queue-size 4 --onnx-model /models/yolox_nano.onnx --perception-csv "$result_dir/perception.csv"
+else
+  case "$scenario" in
+    realtime)
+      set -- --speed 1 --queue-size 8 --queue-policy drop-oldest
+      ;;
+    burst-drop)
+      set -- --speed 0 --queue-size 8 --queue-policy drop-oldest
+      ;;
+    burst-backpressure)
+      set -- --speed 0 --queue-size 8 --queue-policy backpressure
+      ;;
+    overloaded)
+      set -- --speed 1 --queue-size 8 --queue-policy drop-oldest --lidar-work-ms 125
+      ;;
+  esac
+  set -- "$@" --csv "$result_dir/measurements.csv"
+fi
 
 {
   echo "scenario=$scenario"
@@ -80,7 +96,6 @@ pipes-rs \
   --camera front \
   --lidar top \
   "$@" \
-  --csv "$result_dir/measurements.csv" \
   2>&1 | tee "$result_dir/output.log"
 end_ns="$(date +%s%N)"
 elapsed_ns=$((end_ns - start_ns))

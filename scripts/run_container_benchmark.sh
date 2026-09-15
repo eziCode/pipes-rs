@@ -5,9 +5,9 @@ scenario="${1:-realtime}"
 run_id="${2:-run-001}"
 
 case "$scenario" in
-  realtime|burst-drop|burst-backpressure|overloaded) ;;
+  realtime|burst-drop|burst-backpressure|overloaded|perception|perception-onnx) ;;
   *)
-    echo "usage: $0 {realtime|burst-drop|burst-backpressure|overloaded} [run-id]" >&2
+    echo "usage: $0 {realtime|burst-drop|burst-backpressure|overloaded|perception|perception-onnx} [run-id]" >&2
     exit 2
     ;;
 esac

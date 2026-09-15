@@ -2,9 +2,11 @@ use std::{
     cmp::Ordering,
     collections::HashMap,
     fs::File,
+    io::{BufWriter, Write},
     path::{Path, PathBuf},
-    sync::Arc,
-    time::Instant,
+    sync::{Arc, mpsc::sync_channel},
+    thread,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result, bail};
@@ -40,6 +42,7 @@ struct CameraFrame {
 }
 
 struct LidarFrame {
+    timestamp: i64,
     values: Vec<f32>,
     shape: [usize; 3],
 }
@@ -69,7 +72,7 @@ struct PointCloud {
     points: Vec<Point>,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 struct Detection {
     id: String,
     kind: &'static str,
@@ -79,6 +82,48 @@ struct Detection {
     height: f64,
     depth_m: Option<f32>,
     depth_points: usize,
+    score: Option<f32>,
+}
+
+pub struct PerceptionSummary {
+    pub frames: usize,
+    pub points: usize,
+    pub detections: usize,
+    pub depth_matched: usize,
+    pub elapsed: Duration,
+    pub true_positives: usize,
+    pub false_positives: usize,
+    pub false_negatives: usize,
+}
+
+pub struct PerceptionConfig<'a> {
+    pub frame_limit: usize,
+    pub queue_size: usize,
+    pub onnx_model: Option<&'a Path>,
+    pub confidence: f32,
+    pub nms: f32,
+}
+
+struct CameraOutput {
+    timestamp: i64,
+    image_width: u32,
+    image_height: u32,
+    image_checksum: u32,
+    detections: Vec<Detection>,
+    detection_batch: RecordBatch,
+    ground_truth: Vec<Detection>,
+    inference_ns: u64,
+    stage_ns: u64,
+    started: Instant,
+    enqueued: Instant,
+}
+
+struct LidarOutput {
+    timestamp: i64,
+    cloud: PointCloud,
+    stage_ns: u64,
+    started: Instant,
+    enqueued: Instant,
 }
 
 #[derive(Serialize)]
@@ -95,6 +140,218 @@ struct DemoPayload<'a> {
     boxes: Vec<Detection>,
     processing_ms: f64,
     arrow_file: String,
+}
+
+pub fn run_segment_pipeline(
+    root: &Path,
+    split: &str,
+    segment: &str,
+    config: PerceptionConfig<'_>,
+    output: &Path,
+) -> Result<PerceptionSummary> {
+    let PerceptionConfig {
+        frame_limit,
+        queue_size,
+        onnx_model,
+        confidence,
+        nms,
+    } = config;
+    let run_started = Instant::now();
+    let boxes = Arc::new(read_all_boxes(&component_path(
+        root,
+        split,
+        "camera_box",
+        segment,
+    ))?);
+    let (camera_tx, camera_rx) = sync_channel(queue_size);
+    let (lidar_tx, lidar_rx) = sync_channel(queue_size);
+
+    let camera_path = component_path(root, split, "camera_image", segment);
+    let camera_boxes = Arc::clone(&boxes);
+    let model_path = onnx_model.map(Path::to_path_buf);
+    let camera_worker = thread::Builder::new()
+        .name("camera-decode".to_owned())
+        .spawn(move || -> Result<()> {
+            let mut detector = model_path
+                .as_deref()
+                .map(|path| crate::detector::YoloxDetector::load(path, confidence, nms))
+                .transpose()?;
+            visit_camera_frames(&camera_path, frame_limit, |frame| {
+                let started = Instant::now();
+                let decoded = image::load_from_memory(&frame.jpeg)
+                    .context("failed to decode a Waymo camera JPEG")?;
+                let rgb = decoded.to_rgb8();
+                let mut checksum = crc32fast::Hasher::new();
+                checksum.update(rgb.as_raw());
+                let ground_truth = camera_boxes
+                    .get(&frame.timestamp)
+                    .cloned()
+                    .unwrap_or_default();
+                let inference_started = Instant::now();
+                let detections = if let Some(detector) = detector.as_mut() {
+                    detector
+                        .detect(&decoded)?
+                        .into_iter()
+                        .enumerate()
+                        .map(|(index, prediction)| Detection {
+                            id: format!("onnx-{index}"),
+                            kind: prediction.kind,
+                            x: prediction.x,
+                            y: prediction.y,
+                            width: prediction.width,
+                            height: prediction.height,
+                            depth_m: None,
+                            depth_points: 0,
+                            score: Some(prediction.score),
+                        })
+                        .collect()
+                } else {
+                    ground_truth.clone()
+                };
+                let inference_ns = detector
+                    .as_ref()
+                    .map(|_| elapsed_ns(inference_started))
+                    .unwrap_or(0);
+                let detection_batch = detection_batch(&detections)?;
+                let output = CameraOutput {
+                    timestamp: frame.timestamp,
+                    image_width: rgb.width(),
+                    image_height: rgb.height(),
+                    image_checksum: checksum.finalize(),
+                    detections,
+                    detection_batch,
+                    ground_truth,
+                    inference_ns,
+                    stage_ns: elapsed_ns(started),
+                    started,
+                    enqueued: Instant::now(),
+                };
+                camera_tx
+                    .send(output)
+                    .map_err(|_| anyhow::anyhow!("fusion stage closed the camera channel"))
+            })
+        })?;
+
+    let lidar_path = component_path(root, split, "lidar", segment);
+    let projection_path = component_path(root, split, "lidar_camera_projection", segment);
+    let calibration_path = component_path(root, split, "lidar_calibration", segment);
+    let lidar_worker = thread::Builder::new()
+        .name("lidar-arrow".to_owned())
+        .spawn(move || -> Result<()> {
+            let calibration = read_calibration(&calibration_path)?;
+            let projections = read_all_top_lidar_frames(
+                &projection_path,
+                "[LiDARCameraProjectionComponent]",
+                frame_limit,
+            )?;
+            visit_top_lidar_frames(&lidar_path, "[LiDARComponent]", frame_limit, |frame| {
+                let started = Instant::now();
+                let projection = projections
+                    .get(&frame.timestamp)
+                    .with_context(|| format!("missing camera projection at {}", frame.timestamp))?;
+                let cloud = convert_top_lidar(&frame, projection, &calibration)?;
+                let output = LidarOutput {
+                    timestamp: frame.timestamp,
+                    cloud,
+                    stage_ns: elapsed_ns(started),
+                    started,
+                    enqueued: Instant::now(),
+                };
+                lidar_tx
+                    .send(output)
+                    .map_err(|_| anyhow::anyhow!("fusion stage closed the LiDAR channel"))
+            })
+        })?;
+
+    if let Some(parent) = output
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut csv = BufWriter::new(
+        File::create(output).with_context(|| format!("failed to create {}", output.display()))?,
+    );
+    writeln!(
+        csv,
+        "frame,timestamp_micros,status,camera_width,camera_height,camera_checksum,points,detections,ground_truth,true_positives,false_positives,false_negatives,depth_matched,camera_stage_ns,inference_ns,lidar_stage_ns,camera_queue_wait_ns,lidar_queue_wait_ns,sync_skew_ns,fusion_ns,end_to_end_ns"
+    )?;
+    let mut summary = PerceptionSummary {
+        frames: 0,
+        points: 0,
+        detections: 0,
+        depth_matched: 0,
+        elapsed: Duration::ZERO,
+        true_positives: 0,
+        false_positives: 0,
+        false_negatives: 0,
+    };
+    while let Ok(mut camera) = camera_rx.recv() {
+        let camera_wait = elapsed_ns(camera.enqueued);
+        let lidar = lidar_rx
+            .recv()
+            .context("LiDAR stage ended before the camera stage")?;
+        let lidar_wait = elapsed_ns(lidar.enqueued);
+        let skew_ns = camera.timestamp.abs_diff(lidar.timestamp) * 1_000;
+        let fusion_started = Instant::now();
+        if camera.timestamp == lidar.timestamp {
+            add_depths(&mut camera.detections, &lidar.cloud.points);
+        }
+        let fusion_ns = elapsed_ns(fusion_started);
+        let (true_positives, false_positives, false_negatives) =
+            evaluate_detections(&camera.detections, &camera.ground_truth, 0.5);
+        let depth_matched = camera
+            .detections
+            .iter()
+            .filter(|detection| detection.depth_m.is_some())
+            .count();
+        let first_started = camera.started.min(lidar.started);
+        writeln!(
+            csv,
+            "{},{},{},{},{},{:08x},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
+            summary.frames,
+            camera.timestamp,
+            if camera.timestamp == lidar.timestamp {
+                "delivered"
+            } else {
+                "unsynchronized"
+            },
+            camera.image_width,
+            camera.image_height,
+            camera.image_checksum,
+            lidar.cloud.batch.num_rows(),
+            camera.detection_batch.num_rows(),
+            camera.ground_truth.len(),
+            true_positives,
+            false_positives,
+            false_negatives,
+            depth_matched,
+            camera.stage_ns,
+            camera.inference_ns,
+            lidar.stage_ns,
+            camera_wait,
+            lidar_wait,
+            skew_ns,
+            fusion_ns,
+            elapsed_ns(first_started),
+        )?;
+        summary.frames += 1;
+        summary.points += lidar.cloud.batch.num_rows();
+        summary.detections += camera.detection_batch.num_rows();
+        summary.depth_matched += depth_matched;
+        summary.true_positives += true_positives;
+        summary.false_positives += false_positives;
+        summary.false_negatives += false_negatives;
+    }
+    camera_worker
+        .join()
+        .map_err(|_| anyhow::anyhow!("camera stage panicked"))??;
+    lidar_worker
+        .join()
+        .map_err(|_| anyhow::anyhow!("LiDAR stage panicked"))??;
+    csv.flush()?;
+    summary.elapsed = run_started.elapsed();
+    Ok(summary)
 }
 
 pub fn build_demo(
@@ -190,7 +447,7 @@ fn reader(path: &Path) -> Result<parquet::arrow::arrow_reader::ParquetRecordBatc
         )
     })?;
     Ok(ParquetRecordBatchReaderBuilder::try_new(file)?
-        .with_batch_size(256)
+        .with_batch_size(16)
         .build()?)
 }
 
@@ -232,7 +489,11 @@ fn read_lidar_frame(path: &Path, target_timestamp: i64, prefix: &str) -> Result<
                     shape.iter().product::<usize>() == values.len(),
                     "range-image shape does not match value count"
                 );
-                return Ok(LidarFrame { values, shape });
+                return Ok(LidarFrame {
+                    timestamp: target_timestamp,
+                    values,
+                    shape,
+                });
             }
         }
     }
@@ -411,6 +672,189 @@ fn point_batch(points: &[Point]) -> Result<RecordBatch> {
     .context("failed to construct the Arrow point-cloud batch")
 }
 
+fn detection_batch(detections: &[Detection]) -> Result<RecordBatch> {
+    let schema = Arc::new(Schema::new_with_metadata(
+        vec![
+            Field::new("object_id", DataType::Utf8, false),
+            Field::new("class", DataType::Utf8, false),
+            Field::new("score", DataType::Float32, true),
+            Field::new("x", DataType::Float64, false),
+            Field::new("y", DataType::Float64, false),
+            Field::new("width", DataType::Float64, false),
+            Field::new("height", DataType::Float64, false),
+        ],
+        HashMap::from([(
+            "coordinate_frame".to_owned(),
+            "front_camera_pixels".to_owned(),
+        )]),
+    ));
+    let float64_column = |value: fn(&Detection) -> f64| -> ArrayRef {
+        Arc::new(Float64Array::from_iter_values(detections.iter().map(value)))
+    };
+    RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(StringArray::from_iter_values(
+                detections.iter().map(|detection| detection.id.as_str()),
+            )),
+            Arc::new(StringArray::from_iter_values(
+                detections.iter().map(|detection| detection.kind),
+            )),
+            Arc::new(Float32Array::from_iter(
+                detections.iter().map(|detection| detection.score),
+            )),
+            float64_column(|detection| detection.x),
+            float64_column(|detection| detection.y),
+            float64_column(|detection| detection.width),
+            float64_column(|detection| detection.height),
+        ],
+    )
+    .context("failed to construct the Arrow detection batch")
+}
+
+fn visit_camera_frames(
+    path: &Path,
+    limit: usize,
+    mut visit: impl FnMut(CameraFrame) -> Result<()>,
+) -> Result<()> {
+    let mut count = 0;
+    for batch in reader(path)? {
+        let batch = batch?;
+        let timestamp = int64(&batch, "key.frame_timestamp_micros")?;
+        let camera = integer(&batch, "key.camera_name")?;
+        let image = binary(&batch, "[CameraImageComponent].image")?;
+        for row in 0..batch.num_rows() {
+            if camera(row) != FRONT_CAMERA {
+                continue;
+            }
+            visit(CameraFrame {
+                timestamp: timestamp.value(row),
+                jpeg: image.value(row).to_vec(),
+            })?;
+            count += 1;
+            if limit > 0 && count >= limit {
+                return Ok(());
+            }
+        }
+    }
+    Ok(())
+}
+
+fn visit_top_lidar_frames(
+    path: &Path,
+    prefix: &str,
+    limit: usize,
+    mut visit: impl FnMut(LidarFrame) -> Result<()>,
+) -> Result<()> {
+    let mut count = 0;
+    for batch in reader(path)? {
+        let batch = batch?;
+        let timestamp = int64(&batch, "key.frame_timestamp_micros")?;
+        let laser = integer(&batch, "key.laser_name")?;
+        for row in 0..batch.num_rows() {
+            if laser(row) != TOP_LIDAR {
+                continue;
+            }
+            let values = list_f32(&batch, &format!("{prefix}.range_image_return1.values"), row)?;
+            let raw_shape = fixed_i32(&batch, &format!("{prefix}.range_image_return1.shape"), row)?;
+            anyhow::ensure!(
+                raw_shape.len() == 3,
+                "range-image shape must have 3 dimensions"
+            );
+            let shape = [
+                raw_shape[0] as usize,
+                raw_shape[1] as usize,
+                raw_shape[2] as usize,
+            ];
+            anyhow::ensure!(shape.iter().product::<usize>() == values.len());
+            visit(LidarFrame {
+                timestamp: timestamp.value(row),
+                values,
+                shape,
+            })?;
+            count += 1;
+            if limit > 0 && count >= limit {
+                return Ok(());
+            }
+        }
+    }
+    Ok(())
+}
+
+fn read_all_top_lidar_frames(
+    path: &Path,
+    prefix: &str,
+    limit: usize,
+) -> Result<HashMap<i64, LidarFrame>> {
+    let mut frames = HashMap::new();
+    visit_top_lidar_frames(path, prefix, limit, |frame| {
+        frames.insert(frame.timestamp, frame);
+        Ok(())
+    })?;
+    Ok(frames)
+}
+
+fn read_all_boxes(path: &Path) -> Result<HashMap<i64, Vec<Detection>>> {
+    let mut output: HashMap<i64, Vec<Detection>> = HashMap::new();
+    for batch in reader(path)? {
+        let batch = batch?;
+        let timestamp = int64(&batch, "key.frame_timestamp_micros")?;
+        let camera = integer(&batch, "key.camera_name")?;
+        let id = string(&batch, "key.camera_object_id")?;
+        let center_x = float64(&batch, "[CameraBoxComponent].box.center.x")?;
+        let center_y = float64(&batch, "[CameraBoxComponent].box.center.y")?;
+        let width = float64(&batch, "[CameraBoxComponent].box.size.x")?;
+        let height = float64(&batch, "[CameraBoxComponent].box.size.y")?;
+        let kind = integer(&batch, "[CameraBoxComponent].type")?;
+        for row in 0..batch.num_rows() {
+            if camera(row) != FRONT_CAMERA {
+                continue;
+            }
+            let width = width.value(row);
+            let height = height.value(row);
+            output
+                .entry(timestamp.value(row))
+                .or_default()
+                .push(Detection {
+                    id: id.value(row).to_owned(),
+                    kind: object_type(kind(row)),
+                    x: center_x.value(row) - width / 2.0,
+                    y: center_y.value(row) - height / 2.0,
+                    width,
+                    height,
+                    depth_m: None,
+                    depth_points: 0,
+                    score: None,
+                });
+        }
+    }
+    Ok(output)
+}
+
+fn add_depths(detections: &mut [Detection], points: &[Point]) {
+    for detection in detections {
+        let mut ranges: Vec<f32> = points
+            .iter()
+            .filter(|point| {
+                point.camera == FRONT_CAMERA as i8
+                    && point.u as f64 >= detection.x
+                    && point.u as f64 <= detection.x + detection.width
+                    && point.v as f64 >= detection.y
+                    && point.v as f64 <= detection.y + detection.height
+            })
+            .map(|point| point.range)
+            .filter(|range| range.is_finite())
+            .collect();
+        ranges.sort_by(|left, right| left.partial_cmp(right).unwrap_or(Ordering::Equal));
+        detection.depth_points = ranges.len();
+        detection.depth_m = (!ranges.is_empty()).then(|| ranges[ranges.len() / 2]);
+    }
+}
+
+fn elapsed_ns(started: Instant) -> u64 {
+    started.elapsed().as_nanos().min(u64::MAX as u128) as u64
+}
+
 fn read_boxes(path: &Path, timestamp_target: i64, points: &[Point]) -> Result<Vec<Detection>> {
     let mut boxes = Vec::new();
     for batch in reader(path)? {
@@ -456,6 +900,7 @@ fn read_boxes(path: &Path, timestamp_target: i64, points: &[Point]) -> Result<Ve
                 height,
                 depth_m,
                 depth_points: ranges.len(),
+                score: None,
             });
         }
     }
@@ -470,6 +915,42 @@ fn object_type(value: i64) -> &'static str {
         4 => "cyclist",
         _ => "unknown",
     }
+}
+
+fn evaluate_detections(
+    predictions: &[Detection],
+    ground_truth: &[Detection],
+    threshold: f64,
+) -> (usize, usize, usize) {
+    let mut matched = vec![false; ground_truth.len()];
+    let mut true_positives = 0;
+    for prediction in predictions {
+        let best = ground_truth
+            .iter()
+            .enumerate()
+            .filter(|(index, truth)| !matched[*index] && truth.kind == prediction.kind)
+            .map(|(index, truth)| (index, detection_iou(prediction, truth)))
+            .filter(|(_, iou)| *iou >= threshold)
+            .max_by(|a, b| a.1.total_cmp(&b.1));
+        if let Some((index, _)) = best {
+            matched[index] = true;
+            true_positives += 1;
+        }
+    }
+    (
+        true_positives,
+        predictions.len() - true_positives,
+        ground_truth.len() - true_positives,
+    )
+}
+
+fn detection_iou(a: &Detection, b: &Detection) -> f64 {
+    let x1 = a.x.max(b.x);
+    let y1 = a.y.max(b.y);
+    let x2 = (a.x + a.width).min(b.x + b.width);
+    let y2 = (a.y + a.height).min(b.y + b.height);
+    let intersection = (x2 - x1).max(0.0) * (y2 - y1).max(0.0);
+    intersection / (a.width * a.height + b.width * b.height - intersection).max(f64::EPSILON)
 }
 
 fn downsample_for_render(points: &[Point]) -> Vec<RenderPoint> {
@@ -611,10 +1092,12 @@ mod tests {
     #[test]
     fn converts_valid_ranges_to_an_arrow_point_cloud() {
         let lidar = LidarFrame {
+            timestamp: 123,
             values: vec![10.0, 0.5, 0.1, 0.0, 0.0, 0.2, 0.3, 0.0],
             shape: [1, 2, 4],
         };
         let projection = LidarFrame {
+            timestamp: 123,
             values: vec![
                 1.0, 100.0, 200.0, 0.0, 0.0, 0.0, 1.0, 120.0, 220.0, 0.0, 0.0, 0.0,
             ],
