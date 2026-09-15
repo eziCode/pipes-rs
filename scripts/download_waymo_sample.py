@@ -53,6 +53,7 @@ CORE_COMPONENTS = (
     "camera_image",
     "camera_calibration",
     "lidar",
+    "lidar_camera_projection",
     "lidar_calibration",
     "lidar_pose",
     "vehicle_pose",

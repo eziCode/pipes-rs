@@ -106,6 +106,31 @@ Set `--speed 0` to run without real-time pacing. Use `--camera-work-ms` or
 `--queue-policy backpressure` to make the producer wait instead. The optional
 CSV contains one row per delivered or dropped measurement.
 
+## Build the camera + LiDAR fusion demo
+
+Milestone 1 converts one top-LiDAR range image into Cartesian `x/y/z` Arrow
+columns, associates projected LiDAR ranges with front-camera boxes, and writes
+a standalone inspection page alongside the Arrow IPC point cloud:
+
+```bash
+cargo run --release -- \
+  --segment 10023947602400723454_1120_000_1140_000 \
+  --frame-index 0 \
+  --demo-output demo-output/frame-000.html
+```
+
+Open `demo-output/frame-000.html` in a browser. Hover over a camera box to see
+its median LiDAR depth and highlight the associated points in the bird's-eye
+view. The boxes are Waymo ground truth in this milestone; this gives the future
+camera model a deterministic reference. The Arrow file contains the processed
+point cloud in the vehicle coordinate frame, including range, intensity,
+elongation, and front-camera projection columns.
+
+The first run may take a little while while Cargo builds the release binary.
+Subsequent frames can be selected with `--frame-index`. Per-pixel LiDAR motion
+compensation and model-produced camera detections are intentionally deferred to
+the next milestone.
+
 ## Reproducible container benchmarks
 
 The benchmark container bakes in the release binary and runs without network

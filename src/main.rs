@@ -1,3 +1,4 @@
+mod fusion;
 mod measurement;
 mod metrics;
 mod queue;
@@ -61,6 +62,14 @@ struct Args {
     /// Write one delivered/dropped measurement record per CSV row.
     #[arg(long)]
     csv: Option<PathBuf>,
+
+    /// Build a synchronized camera + LiDAR inspection page instead of replaying.
+    #[arg(long)]
+    demo_output: Option<PathBuf>,
+
+    /// Zero-based front-camera frame used by --demo-output.
+    #[arg(long, default_value_t = 0)]
+    frame_index: usize,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -80,6 +89,27 @@ impl From<PolicyArg> for QueuePolicy {
 
 fn main() -> Result<()> {
     let args = Args::parse();
+
+    if let Some(output) = &args.demo_output {
+        let summary = fusion::build_demo(
+            &args.data_root,
+            &args.split,
+            &args.segment,
+            args.frame_index,
+            output,
+        )?;
+        println!("fusion demo: {}", summary.html.display());
+        println!("Arrow point cloud: {}", summary.arrow.display());
+        println!(
+            "frame={} timestamp={} points={} boxes={} boxes_with_depth={}",
+            args.frame_index,
+            summary.timestamp_micros,
+            summary.points,
+            summary.boxes,
+            summary.boxes_with_depth
+        );
+        return Ok(());
+    }
     anyhow::ensure!(args.speed >= 0.0, "--speed must be non-negative");
     anyhow::ensure!(args.queue_size > 0, "--queue-size must be at least 1");
 

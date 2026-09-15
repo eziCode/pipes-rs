@@ -4,6 +4,7 @@
 /target/
 /pipeline-metrics.csv
 /benchmark-results/
+/demo-output/
 
 # Python tooling
 __pycache__/

@@ -8,10 +8,12 @@ description = "Instrumented Apache Arrow sensor pipeline"
 [dependencies]
 anyhow = "1"
 arrow = { version = "56", features = ["ipc"] }
+base64 = "0.22"
 clap = { version = "4", features = ["derive"] }
 crc32fast = "1"
 parquet = { version = "56", features = ["arrow"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 
 [profile.release]
 lto = "thin"
-
