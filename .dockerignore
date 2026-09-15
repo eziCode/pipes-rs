@@ -1,0 +1,12 @@
+.git
+.gitignore
+.codex
+.agents
+benchmark-results
+data
+docs
+graphify-out
+pipeline-metrics.csv
+target
+*.html
+

@@ -1,0 +1,17 @@
+[package]
+name = "pipes-rs"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+description = "Instrumented Apache Arrow sensor pipeline"
+
+[dependencies]
+anyhow = "1"
+arrow = { version = "56", features = ["ipc"] }
+clap = { version = "4", features = ["derive"] }
+crc32fast = "1"
+parquet = { version = "56", features = ["arrow"] }
+
+[profile.release]
+lto = "thin"
+

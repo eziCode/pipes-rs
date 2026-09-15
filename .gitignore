@@ -1,6 +1,9 @@
 # Downloaded datasets and generated analysis artifacts
 /data/
 /graphify-out/
+/target/
+/pipeline-metrics.csv
+/benchmark-results/
 
 # Python tooling
 __pycache__/

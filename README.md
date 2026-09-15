@@ -82,3 +82,65 @@ Pass `--count 2` to download both sample segments. Data is written under
 requires a quota project, pass `--billing-project YOUR_GCP_PROJECT`. If
 `gcloud storage` reports a broken local CRC32C checksum, retry with
 `--transfer-tool gsutil`.
+
+## Run the Arrow pipeline MVP
+
+The MVP replays the front camera and top LiDAR from one downloaded segment into
+separate bounded queues. Each measurement remains a one-row Arrow record batch.
+Consumers encode the batch as Arrow IPC, checksum it, and report queue wait,
+measurement age, delivery rate, drops, sequence gaps, bytes, and queue depth.
+
+```bash
+cargo run --release -- \
+  --segment 10023947602400723454_1120_000_1140_000 \
+  --camera front \
+  --lidar top \
+  --queue-size 8 \
+  --queue-policy drop-oldest \
+  --speed 1.0 \
+  --csv pipeline-metrics.csv
+```
+
+Set `--speed 0` to run without real-time pacing. Use `--camera-work-ms` or
+`--lidar-work-ms` to simulate slow processing and exercise queue drops, or use
+`--queue-policy backpressure` to make the producer wait instead. The optional
+CSV contains one row per delivered or dropped measurement.
+
+## Reproducible container benchmarks
+
+The benchmark container bakes in the release binary and runs without network
+access. Waymo inputs are mounted read-only, results are isolated by scenario and
+run ID, and Compose limits each run to 2 CPUs, 4 GB of memory, and 128 processes.
+The Rust and Debian base images are pinned by digest and Cargo uses the committed
+lockfile.
+
+Docker Desktop must be running. Execute the real-time baseline with:
+
+```bash
+./scripts/run_container_benchmark.sh realtime run-001
+```
+
+Available scenarios use fixed parameters:
+
+| Scenario | Replay and queue behavior |
+| --- | --- |
+| `realtime` | 1× replay, queue 8, drop-oldest |
+| `burst-drop` | Unpaced replay, queue 8, drop-oldest |
+| `burst-backpressure` | Unpaced replay, queue 8, producer backpressure |
+| `overloaded` | 1× replay with 125 ms of LiDAR work per sample |
+
+Use a new run ID for every repeat; existing results are never overwritten:
+
+```bash
+./scripts/run_container_benchmark.sh realtime run-002
+```
+
+Each run writes `measurements.csv`, `output.log`, `timing.txt`,
+`environment.txt`, `input.sha256`, `image.json`, and the resolved `compose.yaml`
+beneath
+`benchmark-results/<scenario>/<run-id>/`. Input hashing happens before timing
+and warms the same camera and LiDAR files for every run.
+
+The default platform is `linux/arm64`, matching Apple Silicon. A different host
+can set `BENCHMARK_PLATFORM`, but performance results should only be compared
+when the platform, Docker resource allocation, and host machine are identical.
