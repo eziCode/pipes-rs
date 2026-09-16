@@ -4,4 +4,5 @@ pub mod measurement;
 pub mod metrics;
 pub mod queue;
 pub mod replay;
+pub mod transport;
 pub mod waymo;

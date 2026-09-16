@@ -28,6 +28,9 @@ LABEL org.opencontainers.image.description="Reproducible Dora/Arrow Waymo percep
 COPY --from=builder /tmp/pipes-dora-benchmark /usr/local/bin/pipes-dora-benchmark
 COPY --from=builder /tmp/dora/bin/ /usr/local/bin/
 COPY benchmarks/dora/dataflow.container.yml /benchmark/dataflow.yml
+COPY benchmarks/dora/camera-only.container.yml /benchmark/camera-only.yml
+COPY benchmarks/dora/lidar-only.container.yml /benchmark/lidar-only.yml
+COPY benchmarks/dora/transport.container.yml /benchmark/transport.yml
 COPY docker/dora-benchmark-entrypoint.sh /usr/local/bin/dora-benchmark-entrypoint
 
 ENTRYPOINT ["/usr/local/bin/dora-benchmark-entrypoint"]

@@ -253,3 +253,58 @@ To run without Docker, install Dora CLI 1.0.1 and use:
 cargo install dora-cli --version 1.0.1 --locked
 ./scripts/run_dora_benchmark.sh dora-local-01
 ```
+
+## Normalized pipes-rs × Dora baseline
+
+The normalized benchmark makes both implementations decode the same camera
+JPEGs, convert the image to RGB, calculate the same CRC32 checksum, run the
+same YOLOX model, and transport the same nine LiDAR point fields. Full and
+component dataflows use queue capacity four with backpressure. Normalized run
+artifacts use one shared metric contract covering setup, compute,
+queue/transport, fusion, and source-to-fusion age measurements.
+
+Run the complete matrix five times per framework with alternating execution
+order:
+
+```bash
+./scripts/run_baseline_matrix.sh baseline-01 5
+```
+
+This runs five isolated scenarios:
+
+| Scenario | What it isolates |
+| --- | --- |
+| `full` | Parquet input, camera, LiDAR, Arrow transport, synchronization and fusion |
+| `camera` | JPEG decode, RGB checksum, YOLOX and detection transport |
+| `lidar` | range-image conversion and the full nine-field point-cloud transport |
+| `overloaded` | full pipeline with 125 ms of fixed fusion work and bounded backpressure |
+| `transport` | 199 in-memory Arrow messages of 149,796 points without Waymo decoding or inference |
+
+The compute-only view is the stage-timing panel in the `full` dashboard. Its
+timers begin after each Parquet row has been materialized, so it excludes
+dataset iteration and framework startup while retaining the real decode,
+inference, conversion and fusion work.
+
+Open the cross-scenario dashboard after the matrix completes:
+
+```bash
+open benchmark-results/baseline/baseline-01/index.html
+```
+
+Each scenario also has a detailed dashboard with per-run runtime, medians,
+p50/p95 latency, standard deviation, throughput, CPU time, peak memory,
+correctness and dropped frames. Raw and aggregate results are retained in
+`runs.csv` and `summary.json`.
+
+Every container run writes `manifest.txt`, `environment.txt`, `input.sha256`,
+`image.json`, and the resolved `compose.yaml`. Together these freeze model and
+dataset hashes, queue settings, confidence/NMS thresholds, framework/Arrow/
+compiler versions, container image, platform, CPU and memory limits. Existing
+run directories are never overwritten.
+
+For a quick wiring check instead of a performance result:
+
+```bash
+FRAME_LIMIT=1 TRANSPORT_FRAMES=3 TRANSPORT_POINTS=1000 \
+  ./scripts/run_baseline_matrix.sh smoke-01 1
+```

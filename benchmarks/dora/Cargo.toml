@@ -10,6 +10,7 @@ publish = false
 anyhow = "1"
 arrow = "59"
 clap = { version = "4", features = ["derive"] }
+crc32fast = "1"
 dora-core = "=1.0.1"
 dora-node-api = { version = "=1.0.1", features = ["arrow-v59"] }
 image = { version = "0.25", default-features = false, features = ["jpeg"] }

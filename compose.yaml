@@ -1,6 +1,6 @@
 services:
   benchmark:
-    image: pipes-rs-benchmark:rust-1.94-arrow-56
+    image: pipes-rs-benchmark:rust-1.94-arrow-59
     build:
       context: .
       dockerfile: Dockerfile
@@ -27,6 +27,9 @@ services:
       RUN_ID: ${BENCHMARK_RUN_ID:-run-001}
       SEGMENT: ${BENCHMARK_SEGMENT:-10023947602400723454_1120_000_1140_000}
       SPLIT: ${BENCHMARK_SPLIT:-training}
+      FRAME_LIMIT: ${FRAME_LIMIT:-0}
+      TRANSPORT_FRAMES: ${TRANSPORT_FRAMES:-199}
+      TRANSPORT_POINTS: ${TRANSPORT_POINTS:-149796}
 
   dora-benchmark:
     image: pipes-rs-dora-benchmark:dora-1.0.1-arrow-59
@@ -56,3 +59,7 @@ services:
       SEGMENT: ${BENCHMARK_SEGMENT:-10023947602400723454_1120_000_1140_000}
       SPLIT: ${BENCHMARK_SPLIT:-training}
       FRAME_LIMIT: ${FRAME_LIMIT:-0}
+      WORKLOAD: ${BENCHMARK_WORKLOAD:-full}
+      FUSION_WORK_MS: ${FUSION_WORK_MS:-0}
+      TRANSPORT_FRAMES: ${TRANSPORT_FRAMES:-199}
+      TRANSPORT_POINTS: ${TRANSPORT_POINTS:-149796}

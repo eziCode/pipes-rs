@@ -1,0 +1,14 @@
+exit_when_nodes_finish: true
+nodes:
+  - id: source
+    path: /usr/local/bin/pipes-dora-benchmark
+    args: transport-source
+    outputs: [payload]
+  - id: sink
+    path: /usr/local/bin/pipes-dora-benchmark
+    args: transport-sink
+    inputs:
+      payload:
+        source: source/payload
+        queue_size: 4
+        queue_policy: backpressure

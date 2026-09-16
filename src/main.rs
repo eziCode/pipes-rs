@@ -72,6 +72,10 @@ struct Args {
     #[arg(long)]
     perception_csv: Option<PathBuf>,
 
+    /// Restrict the perception baseline to one component.
+    #[arg(long, value_enum, default_value_t = PerceptionComponent::Full)]
+    perception_component: PerceptionComponent,
+
     /// Stop a perception run after this many frames; 0 processes the whole segment.
     #[arg(long, default_value_t = 0)]
     frame_limit: usize,
@@ -89,12 +93,33 @@ struct Args {
 
     #[arg(long, default_value_t = 0.45)]
     nms_threshold: f32,
+
+    /// Fixed fusion-stage work used by the overload baseline.
+    #[arg(long, default_value_t = 0)]
+    fusion_work_ms: u64,
+
+    /// Run the in-memory large Arrow payload transport baseline.
+    #[arg(long)]
+    transport_csv: Option<PathBuf>,
+
+    #[arg(long, default_value_t = 199)]
+    transport_frames: usize,
+
+    #[arg(long, default_value_t = 149_796)]
+    transport_points: usize,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
 enum PolicyArg {
     Backpressure,
     DropOldest,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum PerceptionComponent {
+    Full,
+    Camera,
+    Lidar,
 }
 
 impl From<PolicyArg> for QueuePolicy {
@@ -109,24 +134,68 @@ impl From<PolicyArg> for QueuePolicy {
 fn main() -> Result<()> {
     let args = Args::parse();
 
+    if let Some(output) = &args.transport_csv {
+        let elapsed = pipes_rs::transport::run(
+            output,
+            args.transport_frames,
+            args.transport_points,
+            args.stage_queue_size,
+        )?;
+        println!(
+            "transport: frames={} points={} elapsed={:.3}s",
+            args.transport_frames,
+            args.transport_points,
+            elapsed.as_secs_f64()
+        );
+        return Ok(());
+    }
+
     if let Some(output) = &args.perception_csv {
         anyhow::ensure!(
             args.stage_queue_size > 0,
             "--stage-queue-size must be at least 1"
         );
-        let summary = fusion::run_segment_pipeline(
-            &args.data_root,
-            &args.split,
-            &args.segment,
-            fusion::PerceptionConfig {
-                frame_limit: args.frame_limit,
-                queue_size: args.stage_queue_size,
-                onnx_model: args.onnx_model.as_deref(),
-                confidence: args.confidence_threshold,
-                nms: args.nms_threshold,
-            },
-            output,
-        )?;
+        let summary = match args.perception_component {
+            PerceptionComponent::Full => fusion::run_segment_pipeline(
+                &args.data_root,
+                &args.split,
+                &args.segment,
+                fusion::PerceptionConfig {
+                    frame_limit: args.frame_limit,
+                    queue_size: args.stage_queue_size,
+                    onnx_model: args.onnx_model.as_deref(),
+                    confidence: args.confidence_threshold,
+                    nms: args.nms_threshold,
+                    fusion_work_ms: args.fusion_work_ms,
+                },
+                output,
+            )?,
+            PerceptionComponent::Camera => fusion::run_camera_only(
+                &args.data_root,
+                &args.split,
+                &args.segment,
+                fusion::PerceptionConfig {
+                    frame_limit: args.frame_limit,
+                    queue_size: args.stage_queue_size,
+                    onnx_model: Some(
+                        args.onnx_model
+                            .as_deref()
+                            .context("--onnx-model is required for camera baseline")?,
+                    ),
+                    confidence: args.confidence_threshold,
+                    nms: args.nms_threshold,
+                    fusion_work_ms: 0,
+                },
+                output,
+            )?,
+            PerceptionComponent::Lidar => fusion::run_lidar_only(
+                &args.data_root,
+                &args.split,
+                &args.segment,
+                args.frame_limit,
+                output,
+            )?,
+        };
         println!(
             "perception: frames={} points={} detections={} depth_matched={} elapsed={:.2}s rate={:.2}Hz",
             summary.frames,

@@ -102,6 +102,7 @@ pub struct PerceptionConfig<'a> {
     pub onnx_model: Option<&'a Path>,
     pub confidence: f32,
     pub nms: f32,
+    pub fusion_work_ms: u64,
 }
 
 struct CameraOutput {
@@ -155,27 +156,25 @@ pub fn run_segment_pipeline(
         onnx_model,
         confidence,
         nms,
+        fusion_work_ms,
     } = config;
     let run_started = Instant::now();
-    let boxes = Arc::new(read_all_boxes(&component_path(
-        root,
-        split,
-        "camera_box",
-        segment,
-    ))?);
     let (camera_tx, camera_rx) = sync_channel(queue_size);
     let (lidar_tx, lidar_rx) = sync_channel(queue_size);
 
     let camera_path = component_path(root, split, "camera_image", segment);
-    let camera_boxes = Arc::clone(&boxes);
+    let camera_boxes_path = component_path(root, split, "camera_box", segment);
     let model_path = onnx_model.map(Path::to_path_buf);
     let camera_worker = thread::Builder::new()
         .name("camera-decode".to_owned())
-        .spawn(move || -> Result<()> {
+        .spawn(move || -> Result<u64> {
+            let setup_started = Instant::now();
             let mut detector = model_path
                 .as_deref()
                 .map(|path| crate::detector::YoloxDetector::load(path, confidence, nms))
                 .transpose()?;
+            let camera_boxes = read_all_boxes(&camera_boxes_path)?;
+            let setup_ns = elapsed_ns(setup_started);
             visit_camera_frames(&camera_path, frame_limit, |frame| {
                 let started = Instant::now();
                 let decoded = image::load_from_memory(&frame.jpeg)
@@ -229,7 +228,8 @@ pub fn run_segment_pipeline(
                 camera_tx
                     .send(output)
                     .map_err(|_| anyhow::anyhow!("fusion stage closed the camera channel"))
-            })
+            })?;
+            Ok(setup_ns)
         })?;
 
     let lidar_path = component_path(root, split, "lidar", segment);
@@ -237,13 +237,15 @@ pub fn run_segment_pipeline(
     let calibration_path = component_path(root, split, "lidar_calibration", segment);
     let lidar_worker = thread::Builder::new()
         .name("lidar-arrow".to_owned())
-        .spawn(move || -> Result<()> {
+        .spawn(move || -> Result<u64> {
+            let setup_started = Instant::now();
             let calibration = read_calibration(&calibration_path)?;
             let projections = read_all_top_lidar_frames(
                 &projection_path,
                 "[LiDARCameraProjectionComponent]",
                 frame_limit,
             )?;
+            let setup_ns = elapsed_ns(setup_started);
             visit_top_lidar_frames(&lidar_path, "[LiDARComponent]", frame_limit, |frame| {
                 let started = Instant::now();
                 let projection = projections
@@ -260,7 +262,8 @@ pub fn run_segment_pipeline(
                 lidar_tx
                     .send(output)
                     .map_err(|_| anyhow::anyhow!("fusion stage closed the LiDAR channel"))
-            })
+            })?;
+            Ok(setup_ns)
         })?;
 
     if let Some(parent) = output
@@ -294,6 +297,9 @@ pub fn run_segment_pipeline(
         let lidar_wait = elapsed_ns(lidar.enqueued);
         let skew_ns = camera.timestamp.abs_diff(lidar.timestamp) * 1_000;
         let fusion_started = Instant::now();
+        if fusion_work_ms > 0 {
+            thread::sleep(Duration::from_millis(fusion_work_ms));
+        }
         if camera.timestamp == lidar.timestamp {
             add_depths(&mut camera.detections, &lidar.cloud.points);
         }
@@ -343,15 +349,179 @@ pub fn run_segment_pipeline(
         summary.false_positives += false_positives;
         summary.false_negatives += false_negatives;
     }
-    camera_worker
+    let camera_setup_ns = camera_worker
         .join()
         .map_err(|_| anyhow::anyhow!("camera stage panicked"))??;
-    lidar_worker
+    let lidar_setup_ns = lidar_worker
         .join()
         .map_err(|_| anyhow::anyhow!("LiDAR stage panicked"))??;
     csv.flush()?;
+    let mut setup = BufWriter::new(File::create(output.with_extension("setup.txt"))?);
+    writeln!(setup, "camera_setup_ns={camera_setup_ns}")?;
+    writeln!(setup, "lidar_setup_ns={lidar_setup_ns}")?;
+    setup.flush()?;
     summary.elapsed = run_started.elapsed();
     Ok(summary)
+}
+
+pub fn run_camera_only(
+    root: &Path,
+    split: &str,
+    segment: &str,
+    config: PerceptionConfig<'_>,
+    output: &Path,
+) -> Result<PerceptionSummary> {
+    let frame_limit = config.frame_limit;
+    let model = config
+        .onnx_model
+        .context("camera-only baseline requires an ONNX model")?;
+    let run = Instant::now();
+    let setup = Instant::now();
+    let boxes = read_all_boxes(&component_path(root, split, "camera_box", segment))?;
+    let mut detector = crate::detector::YoloxDetector::load(model, config.confidence, config.nms)?;
+    let setup_ns = elapsed_ns(setup);
+    create_parent(output)?;
+    let mut csv = BufWriter::new(File::create(output)?);
+    write_perception_header(&mut csv)?;
+    let mut summary = empty_summary();
+    visit_camera_frames(
+        &component_path(root, split, "camera_image", segment),
+        frame_limit,
+        |frame| {
+            let started = Instant::now();
+            let decoded = image::load_from_memory(&frame.jpeg)?;
+            let rgb = decoded.to_rgb8();
+            let mut checksum = crc32fast::Hasher::new();
+            checksum.update(rgb.as_raw());
+            let inference = Instant::now();
+            let detections = detector.detect(&decoded)?;
+            let inference_ns = elapsed_ns(inference);
+            let truth = boxes.get(&frame.timestamp).cloned().unwrap_or_default();
+            let predicted: Vec<Detection> = detections
+                .into_iter()
+                .enumerate()
+                .map(|(i, p)| Detection {
+                    id: format!("onnx-{i}"),
+                    kind: p.kind,
+                    x: p.x,
+                    y: p.y,
+                    width: p.width,
+                    height: p.height,
+                    depth_m: None,
+                    depth_points: 0,
+                    score: Some(p.score),
+                })
+                .collect();
+            let (tp, fp, fn_) = evaluate_detections(&predicted, &truth, 0.5);
+            writeln!(
+                csv,
+                "{},{},delivered,{},{},{:08x},0,{},{},{tp},{fp},{fn_},0,{},{inference_ns},0,0,0,0,0,{}",
+                summary.frames,
+                frame.timestamp,
+                rgb.width(),
+                rgb.height(),
+                checksum.finalize(),
+                predicted.len(),
+                truth.len(),
+                elapsed_ns(started),
+                elapsed_ns(started)
+            )?;
+            summary.frames += 1;
+            summary.detections += predicted.len();
+            summary.true_positives += tp;
+            summary.false_positives += fp;
+            summary.false_negatives += fn_;
+            Ok(())
+        },
+    )?;
+    csv.flush()?;
+    std::fs::write(
+        output.with_extension("setup.txt"),
+        format!("camera_setup_ns={setup_ns}\nlidar_setup_ns=0\n"),
+    )?;
+    summary.elapsed = run.elapsed();
+    Ok(summary)
+}
+
+pub fn run_lidar_only(
+    root: &Path,
+    split: &str,
+    segment: &str,
+    frame_limit: usize,
+    output: &Path,
+) -> Result<PerceptionSummary> {
+    let run = Instant::now();
+    let setup = Instant::now();
+    let calibration = read_calibration(&component_path(root, split, "lidar_calibration", segment))?;
+    let projections = read_all_top_lidar_frames(
+        &component_path(root, split, "lidar_camera_projection", segment),
+        "[LiDARCameraProjectionComponent]",
+        frame_limit,
+    )?;
+    let setup_ns = elapsed_ns(setup);
+    create_parent(output)?;
+    let mut csv = BufWriter::new(File::create(output)?);
+    write_perception_header(&mut csv)?;
+    let mut summary = empty_summary();
+    visit_top_lidar_frames(
+        &component_path(root, split, "lidar", segment),
+        "[LiDARComponent]",
+        frame_limit,
+        |frame| {
+            let started = Instant::now();
+            let projection = projections
+                .get(&frame.timestamp)
+                .context("missing camera projection")?;
+            let cloud = convert_top_lidar(&frame, projection, &calibration)?;
+            writeln!(
+                csv,
+                "{},{},delivered,0,0,00000000,{},0,0,0,0,0,0,0,0,{},0,0,0,0,{}",
+                summary.frames,
+                frame.timestamp,
+                cloud.points.len(),
+                elapsed_ns(started),
+                elapsed_ns(started)
+            )?;
+            summary.frames += 1;
+            summary.points += cloud.points.len();
+            Ok(())
+        },
+    )?;
+    csv.flush()?;
+    std::fs::write(
+        output.with_extension("setup.txt"),
+        format!("camera_setup_ns=0\nlidar_setup_ns={setup_ns}\n"),
+    )?;
+    summary.elapsed = run.elapsed();
+    Ok(summary)
+}
+
+fn create_parent(output: &Path) -> Result<()> {
+    if let Some(parent) = output.parent().filter(|p| !p.as_os_str().is_empty()) {
+        std::fs::create_dir_all(parent)?;
+    }
+    Ok(())
+}
+
+fn write_perception_header(csv: &mut impl Write) -> Result<()> {
+    writeln!(
+        csv,
+        "frame,timestamp_micros,status,camera_width,camera_height,camera_checksum,points,detections,ground_truth,true_positives,false_positives,false_negatives,depth_matched,camera_stage_ns,inference_ns,lidar_stage_ns,camera_queue_wait_ns,lidar_queue_wait_ns,sync_skew_ns,fusion_ns,end_to_end_ns"
+    )?;
+    Ok(())
+}
+
+fn empty_summary() -> PerceptionSummary {
+    PerceptionSummary {
+        frames: 0,
+        points: 0,
+        detections: 0,
+        depth_matched: 0,
+        elapsed: Duration::ZERO,
+        true_positives: 0,
+        false_positives: 0,
+        false_negatives: 0,
+    }
 }
 
 pub fn build_demo(

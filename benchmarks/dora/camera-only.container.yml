@@ -1,0 +1,14 @@
+exit_when_nodes_finish: true
+nodes:
+  - id: camera
+    path: /usr/local/bin/pipes-dora-benchmark
+    args: camera
+    outputs: [detections]
+  - id: sink
+    path: /usr/local/bin/pipes-dora-benchmark
+    args: camera-sink
+    inputs:
+      detections:
+        source: camera/detections
+        queue_size: 4
+        queue_policy: backpressure

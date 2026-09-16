@@ -1,0 +1,14 @@
+exit_when_nodes_finish: true
+nodes:
+  - id: lidar
+    path: /usr/local/bin/pipes-dora-benchmark
+    args: lidar
+    outputs: [pointcloud]
+  - id: sink
+    path: /usr/local/bin/pipes-dora-benchmark
+    args: lidar-sink
+    inputs:
+      pointcloud:
+        source: lidar/pointcloud
+        queue_size: 4
+        queue_policy: backpressure

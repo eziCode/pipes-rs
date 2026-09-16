@@ -5,9 +5,10 @@ scenario="${SCENARIO:-realtime}"
 run_id="${RUN_ID:-run-001}"
 segment="${SEGMENT:-10023947602400723454_1120_000_1140_000}"
 split="${SPLIT:-training}"
+frame_limit="${FRAME_LIMIT:-0}"
 
 case "$scenario" in
-  realtime|burst-drop|burst-backpressure|overloaded|perception|perception-onnx) ;;
+  realtime|burst-drop|burst-backpressure|overloaded|perception|perception-onnx|perception-camera|perception-lidar|perception-overloaded|arrow-transport) ;;
   *) echo "unknown scenario: $scenario" >&2; exit 2 ;;
 esac
 
@@ -35,12 +36,20 @@ mkdir -p "$result_dir"
 camera_file="/data/waymo-v2-sample/$split/camera_image/$segment.parquet"
 lidar_file="/data/waymo-v2-sample/$split/lidar/$segment.parquet"
 inputs="$camera_file $lidar_file"
-if [ "$scenario" = perception ] || [ "$scenario" = perception-onnx ]; then
+if [ "$scenario" = perception ] || [ "$scenario" = perception-onnx ] || [ "$scenario" = perception-overloaded ]; then
   inputs="$inputs /data/waymo-v2-sample/$split/lidar_camera_projection/$segment.parquet"
   inputs="$inputs /data/waymo-v2-sample/$split/lidar_calibration/$segment.parquet"
   inputs="$inputs /data/waymo-v2-sample/$split/camera_box/$segment.parquet"
 fi
-if [ "$scenario" = perception-onnx ]; then
+if [ "$scenario" = perception-camera ]; then
+  inputs="$camera_file /data/waymo-v2-sample/$split/camera_box/$segment.parquet"
+fi
+if [ "$scenario" = perception-lidar ]; then
+  inputs="$lidar_file /data/waymo-v2-sample/$split/lidar_camera_projection/$segment.parquet"
+  inputs="$inputs /data/waymo-v2-sample/$split/lidar_calibration/$segment.parquet"
+fi
+if [ "$scenario" = arrow-transport ]; then inputs=""; fi
+if [ "$scenario" = perception-onnx ] || [ "$scenario" = perception-camera ] || [ "$scenario" = perception-overloaded ]; then
   inputs="$inputs /models/yolox_nano.onnx"
 fi
 for input in $inputs; do
@@ -52,12 +61,20 @@ done
 
 # Hashing verifies the exact input and intentionally warms both files before
 # every timed run, avoiding a cold-cache/warm-cache difference between repeats.
-sha256sum $inputs > "$result_dir/input.sha256"
+if [ -n "$inputs" ]; then sha256sum $inputs > "$result_dir/input.sha256"; else : > "$result_dir/input.sha256"; fi
 
-if [ "$scenario" = perception ]; then
-  set -- --stage-queue-size 4 --perception-csv "$result_dir/perception.csv"
+if [ "$scenario" = arrow-transport ]; then
+  set -- --transport-frames "${TRANSPORT_FRAMES:-199}" --transport-points "${TRANSPORT_POINTS:-149796}" --stage-queue-size 4 --transport-csv "$result_dir/perception.csv"
+elif [ "$scenario" = perception ]; then
+  set -- --frame-limit "$frame_limit" --stage-queue-size 4 --perception-csv "$result_dir/perception.csv"
 elif [ "$scenario" = perception-onnx ]; then
-  set -- --stage-queue-size 4 --onnx-model /models/yolox_nano.onnx --perception-csv "$result_dir/perception.csv"
+  set -- --frame-limit "$frame_limit" --stage-queue-size 4 --onnx-model /models/yolox_nano.onnx --perception-csv "$result_dir/perception.csv"
+elif [ "$scenario" = perception-camera ]; then
+  set -- --frame-limit "$frame_limit" --stage-queue-size 4 --onnx-model /models/yolox_nano.onnx --perception-component camera --perception-csv "$result_dir/perception.csv"
+elif [ "$scenario" = perception-lidar ]; then
+  set -- --frame-limit "$frame_limit" --stage-queue-size 4 --perception-component lidar --perception-csv "$result_dir/perception.csv"
+elif [ "$scenario" = perception-overloaded ]; then
+  set -- --frame-limit "$frame_limit" --stage-queue-size 4 --onnx-model /models/yolox_nano.onnx --fusion-work-ms 125 --perception-csv "$result_dir/perception.csv"
 else
   case "$scenario" in
     realtime)
@@ -89,6 +106,7 @@ fi
 } > "$result_dir/environment.txt"
 
 start_ns="$(date +%s%N)"
+cpu_start="$(awk '$1=="usage_usec" {print $2}' /sys/fs/cgroup/cpu.stat 2>/dev/null || echo 0)"
 pipes-rs \
   --data-root /data/waymo-v2-sample \
   --segment "$segment" \
@@ -100,3 +118,23 @@ pipes-rs \
 end_ns="$(date +%s%N)"
 elapsed_ns=$((end_ns - start_ns))
 echo "elapsed_ns=$elapsed_ns" | tee "$result_dir/timing.txt"
+cpu_end="$(awk '$1=="usage_usec" {print $2}' /sys/fs/cgroup/cpu.stat 2>/dev/null || echo 0)"
+{
+  echo "cpu_usage_usec=$((cpu_end-cpu_start))"
+  echo "memory_peak_bytes=$(cat /sys/fs/cgroup/memory.peak 2>/dev/null || echo unavailable)"
+} > "$result_dir/resources.txt"
+{
+  echo "framework=pipes-rs"
+  echo "framework_version=0.1.0"
+  echo "arrow_version=59.3.0"
+  echo "rust_builder_version=1.94.0"
+  if [ -r /models/yolox_nano.onnx ]; then
+    echo "model_sha256=$(sha256sum /models/yolox_nano.onnx | awk '{print $1}')"
+  else
+    echo "model_sha256=not-used"
+  fi
+  echo "queue_size=4"
+  echo "queue_policy=backpressure"
+  echo "confidence=0.3"
+  echo "nms=0.45"
+} > "$result_dir/manifest.txt"
