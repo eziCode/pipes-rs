@@ -1,0 +1,22 @@
+exit_when_nodes_finish: true
+nodes:
+  - id: camera
+    path: /usr/local/bin/pipes-dora-benchmark
+    args: camera
+    outputs: [detections]
+  - id: lidar
+    path: /usr/local/bin/pipes-dora-benchmark
+    args: lidar
+    outputs: [pointcloud]
+  - id: fusion
+    path: /usr/local/bin/pipes-dora-benchmark
+    args: fusion
+    inputs:
+      detections:
+        source: camera/detections
+        queue_size: 4
+        queue_policy: backpressure
+      pointcloud:
+        source: lidar/pointcloud
+        queue_size: 4
+        queue_policy: backpressure

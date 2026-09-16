@@ -219,3 +219,37 @@ and warms the same camera and LiDAR files for every run.
 The default platform is `linux/arm64`, matching Apple Silicon. A different host
 can set `BENCHMARK_PLATFORM`, but performance results should only be compared
 when the platform, Docker resource allocation, and host machine are identical.
+
+## Equivalent Dora benchmark
+
+The Dora comparison runs the same YOLOX camera inference, Waymo top-LiDAR
+conversion, timestamp matching, depth fusion, and IoU evaluation as three
+separate Rust nodes. Camera results and the full point cloud cross node
+boundaries as Apache Arrow arrays. Both Dora inputs use a bounded queue of four
+messages with backpressure.
+
+Run the reproducible container workload with:
+
+```bash
+./scripts/run_dora_container_benchmark.sh dora-01
+```
+
+For a quick one-frame validation before a full segment:
+
+```bash
+FRAME_LIMIT=1 ./scripts/run_dora_container_benchmark.sh dora-smoke
+```
+
+Results are written to `benchmark-results/dora/<run-id>/`. The
+`perception.csv` file records camera, inference, LiDAR, Dora fusion, and
+end-to-end timing alongside point counts and detection quality. The Dora image
+uses the same pinned OS image and the same 2 CPU, 4 GB memory, and read-only
+input mounts as the pipes-rs image. Its builder uses pinned Rust 1.95, the
+minimum version supported by Dora 1.0.1 (the pipes-rs builder uses Rust 1.94).
+
+To run without Docker, install Dora CLI 1.0.1 and use:
+
+```bash
+cargo install dora-cli --version 1.0.1 --locked
+./scripts/run_dora_benchmark.sh dora-local-01
+```

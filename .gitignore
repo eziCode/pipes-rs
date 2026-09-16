@@ -2,6 +2,7 @@
 /data/
 /graphify-out/
 /target/
+/benchmarks/dora/target/
 /pipeline-metrics.csv
 /benchmark-results/
 /demo-output/

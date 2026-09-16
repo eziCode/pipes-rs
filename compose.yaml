@@ -27,3 +27,32 @@ services:
       RUN_ID: ${BENCHMARK_RUN_ID:-run-001}
       SEGMENT: ${BENCHMARK_SEGMENT:-10023947602400723454_1120_000_1140_000}
       SPLIT: ${BENCHMARK_SPLIT:-training}
+
+  dora-benchmark:
+    image: pipes-rs-dora-benchmark:dora-1.0.1-arrow-59
+    build:
+      context: .
+      dockerfile: Dockerfile.dora
+    platform: ${BENCHMARK_PLATFORM:-linux/arm64}
+    network_mode: none
+    read_only: true
+    init: true
+    user: "${BENCHMARK_UID:-1000}:${BENCHMARK_GID:-1000}"
+    cpus: ${BENCHMARK_CPUS:-2.0}
+    mem_limit: ${BENCHMARK_MEMORY:-4g}
+    pids_limit: 128
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp:size=256m,mode=1777
+    volumes:
+      - ./data/waymo-v2-sample:/data/waymo-v2-sample:ro
+      - ./models:/models:ro
+      - ./benchmark-results:/results
+    environment:
+      RUN_ID: ${BENCHMARK_RUN_ID:-dora-01}
+      SEGMENT: ${BENCHMARK_SEGMENT:-10023947602400723454_1120_000_1140_000}
+      SPLIT: ${BENCHMARK_SPLIT:-training}
+      FRAME_LIMIT: ${FRAME_LIMIT:-0}

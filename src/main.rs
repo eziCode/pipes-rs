@@ -1,11 +1,3 @@
-mod detector;
-mod fusion;
-mod measurement;
-mod metrics;
-mod queue;
-mod replay;
-mod waymo;
-
 use std::{
     path::PathBuf,
     str::FromStr,
@@ -16,10 +8,14 @@ use std::{
 
 use anyhow::{Context, Result};
 use clap::{Parser, ValueEnum};
-use measurement::SensorId;
-use metrics::{Delivery, RunMetrics};
-use queue::{BoundedQueue, PushResult, QueuePolicy};
-use replay::ReplayClock;
+use pipes_rs::{
+    fusion,
+    measurement::{self, SensorId},
+    metrics::{Delivery, RunMetrics},
+    queue::{BoundedQueue, PushResult, QueuePolicy},
+    replay::ReplayClock,
+    waymo,
+};
 
 #[derive(Debug, Parser)]
 #[command(about = "Replay Waymo camera and LiDAR measurements through bounded Arrow queues")]

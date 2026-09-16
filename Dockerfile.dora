@@ -1,0 +1,33 @@
+# syntax=docker/dockerfile:1.7@sha256:a57df69d0ea827fb7266491f2813635de6f17269be881f696fbfdf2d83dda33e
+
+ARG RUST_IMAGE=rust:1.95.0-trixie@sha256:f49565f188ee00bc2a18dd418183f2c5f23ef7d6e691890517ed341a598f67c3
+ARG RUNTIME_IMAGE=debian:trixie-slim@sha256:d7e12182ce18b85b93007c1dedf31f2d29e01ccf3182cc4017c709b6259bc132
+
+FROM ${RUST_IMAGE} AS builder
+WORKDIR /build
+
+COPY Cargo.toml Cargo.lock ./
+COPY benchmarks/dora/Cargo.toml benchmarks/dora/Cargo.lock ./benchmarks/dora/
+COPY src ./src
+COPY assets ./assets
+COPY benchmarks/dora/src ./benchmarks/dora/src
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/build/benchmarks/dora/target \
+    cargo build --locked --release --manifest-path benchmarks/dora/Cargo.toml \
+    && cp benchmarks/dora/target/release/pipes-dora-benchmark /tmp/pipes-dora-benchmark \
+    && strip /tmp/pipes-dora-benchmark
+
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/build/dora-target \
+    CARGO_TARGET_DIR=/build/dora-target cargo install dora-cli --version 1.0.1 --locked --root /tmp/dora
+
+FROM ${RUNTIME_IMAGE}
+LABEL org.opencontainers.image.title="pipes-rs Dora benchmark"
+LABEL org.opencontainers.image.description="Reproducible Dora/Arrow Waymo perception benchmark"
+
+COPY --from=builder /tmp/pipes-dora-benchmark /usr/local/bin/pipes-dora-benchmark
+COPY --from=builder /tmp/dora/bin/ /usr/local/bin/
+COPY benchmarks/dora/dataflow.container.yml /benchmark/dataflow.yml
+COPY docker/dora-benchmark-entrypoint.sh /usr/local/bin/dora-benchmark-entrypoint
+
+ENTRYPOINT ["/usr/local/bin/dora-benchmark-entrypoint"]

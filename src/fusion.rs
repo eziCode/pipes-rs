@@ -36,53 +36,53 @@ pub struct DemoSummary {
     pub boxes_with_depth: usize,
 }
 
-struct CameraFrame {
-    timestamp: i64,
-    jpeg: Vec<u8>,
+pub struct CameraFrame {
+    pub timestamp: i64,
+    pub jpeg: Vec<u8>,
 }
 
-struct LidarFrame {
-    timestamp: i64,
-    values: Vec<f32>,
-    shape: [usize; 3],
+pub struct LidarFrame {
+    pub timestamp: i64,
+    pub values: Vec<f32>,
+    pub shape: [usize; 3],
 }
 
-struct Calibration {
-    extrinsic: [f64; 16],
-    inclination_min: f64,
-    inclination_max: f64,
-    inclinations: Vec<f64>,
+pub struct Calibration {
+    pub extrinsic: [f64; 16],
+    pub inclination_min: f64,
+    pub inclination_max: f64,
+    pub inclinations: Vec<f64>,
 }
 
 #[derive(Clone)]
-struct Point {
-    x: f32,
-    y: f32,
-    z: f32,
-    range: f32,
-    intensity: f32,
-    elongation: f32,
-    camera: i8,
-    u: f32,
-    v: f32,
+pub struct Point {
+    pub x: f32,
+    pub y: f32,
+    pub z: f32,
+    pub range: f32,
+    pub intensity: f32,
+    pub elongation: f32,
+    pub camera: i8,
+    pub u: f32,
+    pub v: f32,
 }
 
-struct PointCloud {
-    batch: RecordBatch,
-    points: Vec<Point>,
+pub struct PointCloud {
+    pub batch: RecordBatch,
+    pub points: Vec<Point>,
 }
 
 #[derive(Clone, Serialize)]
-struct Detection {
-    id: String,
-    kind: &'static str,
-    x: f64,
-    y: f64,
-    width: f64,
-    height: f64,
-    depth_m: Option<f32>,
-    depth_points: usize,
-    score: Option<f32>,
+pub struct Detection {
+    pub id: String,
+    pub kind: &'static str,
+    pub x: f64,
+    pub y: f64,
+    pub width: f64,
+    pub height: f64,
+    pub depth_m: Option<f32>,
+    pub depth_points: usize,
+    pub score: Option<f32>,
 }
 
 pub struct PerceptionSummary {
@@ -433,7 +433,7 @@ pub fn build_demo(
     })
 }
 
-fn component_path(root: &Path, split: &str, component: &str, segment: &str) -> PathBuf {
+pub fn component_path(root: &Path, split: &str, component: &str, segment: &str) -> PathBuf {
     root.join(split)
         .join(component)
         .join(format!("{segment}.parquet"))
@@ -500,7 +500,7 @@ fn read_lidar_frame(path: &Path, target_timestamp: i64, prefix: &str) -> Result<
     bail!("top LiDAR has no row at camera timestamp {target_timestamp}")
 }
 
-fn read_calibration(path: &Path) -> Result<Calibration> {
+pub fn read_calibration(path: &Path) -> Result<Calibration> {
     for batch in reader(path)? {
         let batch = batch?;
         let laser = integer(&batch, "key.laser_name")?;
@@ -539,7 +539,7 @@ fn read_calibration(path: &Path) -> Result<Calibration> {
     bail!("top LiDAR calibration is missing")
 }
 
-fn convert_top_lidar(
+pub fn convert_top_lidar(
     lidar: &LidarFrame,
     projection: &LidarFrame,
     calibration: &Calibration,
@@ -672,7 +672,7 @@ fn point_batch(points: &[Point]) -> Result<RecordBatch> {
     .context("failed to construct the Arrow point-cloud batch")
 }
 
-fn detection_batch(detections: &[Detection]) -> Result<RecordBatch> {
+pub fn detection_batch(detections: &[Detection]) -> Result<RecordBatch> {
     let schema = Arc::new(Schema::new_with_metadata(
         vec![
             Field::new("object_id", DataType::Utf8, false),
@@ -712,7 +712,7 @@ fn detection_batch(detections: &[Detection]) -> Result<RecordBatch> {
     .context("failed to construct the Arrow detection batch")
 }
 
-fn visit_camera_frames(
+pub fn visit_camera_frames(
     path: &Path,
     limit: usize,
     mut visit: impl FnMut(CameraFrame) -> Result<()>,
@@ -740,7 +740,7 @@ fn visit_camera_frames(
     Ok(())
 }
 
-fn visit_top_lidar_frames(
+pub fn visit_top_lidar_frames(
     path: &Path,
     prefix: &str,
     limit: usize,
@@ -781,7 +781,7 @@ fn visit_top_lidar_frames(
     Ok(())
 }
 
-fn read_all_top_lidar_frames(
+pub fn read_all_top_lidar_frames(
     path: &Path,
     prefix: &str,
     limit: usize,
@@ -794,7 +794,7 @@ fn read_all_top_lidar_frames(
     Ok(frames)
 }
 
-fn read_all_boxes(path: &Path) -> Result<HashMap<i64, Vec<Detection>>> {
+pub fn read_all_boxes(path: &Path) -> Result<HashMap<i64, Vec<Detection>>> {
     let mut output: HashMap<i64, Vec<Detection>> = HashMap::new();
     for batch in reader(path)? {
         let batch = batch?;
@@ -831,7 +831,7 @@ fn read_all_boxes(path: &Path) -> Result<HashMap<i64, Vec<Detection>>> {
     Ok(output)
 }
 
-fn add_depths(detections: &mut [Detection], points: &[Point]) {
+pub fn add_depths(detections: &mut [Detection], points: &[Point]) {
     for detection in detections {
         let mut ranges: Vec<f32> = points
             .iter()
@@ -917,7 +917,7 @@ fn object_type(value: i64) -> &'static str {
     }
 }
 
-fn evaluate_detections(
+pub fn evaluate_detections(
     predictions: &[Detection],
     ground_truth: &[Detection],
     threshold: f64,

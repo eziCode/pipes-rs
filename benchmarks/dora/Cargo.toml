@@ -1,0 +1,18 @@
+[package]
+name = "pipes-dora-benchmark"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[dependencies]
+anyhow = "1"
+arrow = "59"
+clap = { version = "4", features = ["derive"] }
+dora-core = "=1.0.1"
+dora-node-api = { version = "=1.0.1", features = ["arrow-v59"] }
+image = { version = "0.25", default-features = false, features = ["jpeg"] }
+pipes-rs = { path = "../.." }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
