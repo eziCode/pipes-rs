@@ -16,11 +16,17 @@ for path in sorted(base.glob(f"{args.suite}-*")):
     if "pipes-rs" not in data or "dora" not in data: continue
     name = path.name[len(args.suite)+1:]
     p, d = data["pipes-rs"], data["dora"]
-    winner = "pipes-rs" if p["elapsed_s"] <= d["elapsed_s"] else "dora"
-    faster = max(p["elapsed_s"], d["elapsed_s"]) / max(.000001, min(p["elapsed_s"], d["elapsed_s"])) - 1
-    scenarios.append((name, p, d, winner, faster, path.name))
+    valid = (
+        p.get("accounting_valid") == 1
+        and d.get("accounting_valid") == 1
+        and (p["submitted"], p["delivered"], p["dropped"])
+        == (d["submitted"], d["delivered"], d["dropped"])
+    )
+    winner = ("pipes-rs" if p["elapsed_s"] <= d["elapsed_s"] else "dora") if valid else "invalid"
+    faster = 1 - min(p["elapsed_s"], d["elapsed_s"]) / max(p["elapsed_s"], d["elapsed_s"])
+    scenarios.append((name, p, d, winner, faster, path.name, valid))
 if not scenarios: raise SystemExit("no scenario summaries found")
-rows = "".join(f'''<a class="card" href="../{folder}/dashboard.html"><div class="tag">{html.escape(name)}</div><strong>{winner}</strong><span>{faster*100:.1f}% less wall time</span><dl><dt>pipes-rs</dt><dd>{p['elapsed_s']:.2f}s · {p['fps']:.2f} FPS</dd><dt>Dora</dt><dd>{d['elapsed_s']:.2f}s · {d['fps']:.2f} FPS</dd></dl></a>''' for name,p,d,winner,faster,folder in scenarios)
+rows = "".join(f'''<a class="card" href="../{folder}/dashboard.html"><div class="tag">{html.escape(name)}</div><strong>{winner}</strong><span>{f'{faster*100:.1f}% less wall time' if valid else 'work/accounting mismatch'}</span><dl><dt>pipes-rs</dt><dd>{p['elapsed_s']:.2f}s · {p['fps']:.2f} FPS</dd><dt>Dora</dt><dd>{d['elapsed_s']:.2f}s · {d['fps']:.2f} FPS</dd></dl></a>''' for name,p,d,winner,faster,folder,valid in scenarios)
 out = base / args.suite
 out.mkdir(parents=True, exist_ok=True)
 (out / "index.html").write_text(f'''<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>Baseline matrix · {html.escape(args.suite)}</title><style>

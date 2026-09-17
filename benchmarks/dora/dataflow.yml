@@ -6,16 +6,27 @@ nodes:
     args: camera
     outputs:
       - detections
+      - camera_done
+    inputs:
+      completion: fusion/completion
+      credit: fusion/credit
 
   - id: lidar
     path: ../../target/release/pipes-dora-benchmark
     args: lidar
     outputs:
       - pointcloud
+      - lidar_done
+    inputs:
+      completion: fusion/completion
+      credit: fusion/credit
 
   - id: fusion
     path: ../../target/release/pipes-dora-benchmark
     args: fusion
+    outputs:
+      - completion
+      - credit
     inputs:
       detections:
         source: camera/detections
@@ -24,4 +35,12 @@ nodes:
       pointcloud:
         source: lidar/pointcloud
         queue_size: 4
+        queue_policy: backpressure
+      camera_done:
+        source: camera/camera_done
+        queue_size: 1
+        queue_policy: backpressure
+      lidar_done:
+        source: lidar/lidar_done
+        queue_size: 1
         queue_policy: backpressure

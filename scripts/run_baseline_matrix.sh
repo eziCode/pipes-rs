@@ -16,8 +16,14 @@ run_pair() {
     overloaded) pipes_scenario=perception-overloaded; dora_workload=full; fusion_ms=125; pipes_group=perception-overloaded; dora_group=dora ;;
     transport) pipes_scenario=arrow-transport; dora_workload=transport; fusion_ms=0; pipes_group=arrow-transport; dora_group=dora-transport ;;
   esac
-  run_pipes() { ./scripts/run_container_benchmark.sh "$pipes_scenario" "$prefix-pipes"; }
-  run_dora() { FUSION_WORK_MS="$fusion_ms" ./scripts/run_dora_container_benchmark.sh "$prefix-dora" "$dora_workload"; }
+  run_pipes() {
+    result="benchmark-results/$pipes_group/$prefix-pipes"
+    if [ -f "$result/timing.txt" ]; then echo "already complete: $result"; else ./scripts/run_container_benchmark.sh "$pipes_scenario" "$prefix-pipes"; fi
+  }
+  run_dora() {
+    result="benchmark-results/$dora_group/$prefix-dora"
+    if [ -f "$result/timing.txt" ]; then echo "already complete: $result"; else FUSION_WORK_MS="$fusion_ms" ./scripts/run_dora_container_benchmark.sh "$prefix-dora" "$dora_workload"; fi
+  }
   if [ $((number % 2)) -eq 1 ]; then run_pipes; run_dora; else run_dora; run_pipes; fi
 }
 

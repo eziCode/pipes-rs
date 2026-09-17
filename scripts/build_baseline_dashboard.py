@@ -34,7 +34,7 @@ def discover(root, suite, pipes_group, dora_group):
         if not base.exists():
             continue
         for run in sorted(base.glob(f"{suite}-*")):
-            if (run / "perception.csv").exists():
+            if (run / "perception.csv").exists() and (run / "timing.txt").exists():
                 candidates.append((framework, run))
     return candidates
 
@@ -48,6 +48,9 @@ def summarize(framework, run):
     setup = kv(run / "perception.setup.txt")
     setup.update(kv(run / "camera_setup_ns.txt"))
     setup.update(kv(run / "lidar_setup_ns.txt"))
+    setup.update(kv(run / "submitted.txt"))
+    setup.update(kv(run / "delivered.txt"))
+    setup.update(kv(run / "dropped.txt"))
 
     def numbers(column):
         return [int(row.get(column, 0) or 0) for row in rows]
@@ -60,6 +63,16 @@ def summarize(framework, run):
     fp = sum(numbers("false_positives"))
     fn = sum(numbers("false_negatives"))
     queue_column = "camera_queue_wait_ns" if "camera_queue_wait_ns" in rows[0] else "queue_wait_ns"
+    delivered = sum(1 for row in rows if row.get("status", "delivered") == "delivered")
+    explicit_dropped = sum(1 for row in rows if row.get("status", "delivered") == "dropped")
+    accounting_available = all(key in setup for key in ("submitted", "delivered", "dropped"))
+    submitted = int(setup.get("submitted", len(rows)))
+    reported_delivered = int(setup.get("delivered", delivered))
+    reported_dropped = int(setup.get("dropped", explicit_dropped))
+    accounting_valid = (
+        submitted == reported_delivered + reported_dropped
+        and delivered == reported_delivered
+    )
     return {
         "framework": framework,
         "run_id": run.name,
@@ -80,7 +93,11 @@ def summarize(framework, run):
         "memory_peak_mb": int(resources.get("memory_peak_bytes", 0)) / 1048576,
         "detections": sum(numbers("detections")),
         "points": sum(numbers("points")),
-        "dropped": sum(1 for row in rows if row.get("status", "delivered") != "delivered"),
+        "submitted": submitted,
+        "delivered": reported_delivered,
+        "dropped": reported_dropped,
+        "accounting_available": int(accounting_available),
+        "accounting_valid": int(accounting_valid),
         "precision": tp / max(1, tp + fp),
         "recall": tp / max(1, tp + fn),
     }
@@ -96,7 +113,7 @@ def aggregate(runs):
         result[framework] = {"runs": len(selected)}
         for key in numeric:
             values = [run[key] for run in selected]
-            result[framework][key] = statistics.median(values)
+            result[framework][key] = min(values) if key in ("accounting_available", "accounting_valid") else statistics.median(values)
             result[framework][f"{key}_stdev"] = statistics.stdev(values) if len(values) > 1 else 0
     return result
 
@@ -139,15 +156,16 @@ table{{width:100%;border-collapse:collapse}} th,td{{padding:11px 8px;border-bott
 </section></main><script>
 const data={payload}, A=data.aggregate, names=['pipes-rs','dora'], colors={{'pipes-rs':'pipes','dora':'dora'}};
 const fmt=(n,d=2)=>Number(n).toFixed(d), lower=(a,b)=>a<=b?'pipes-rs':'dora';
-const p=A['pipes-rs'],d=A.dora,w=lower(p.elapsed_s,d.elapsed_s),other=w==='pipes-rs'?'dora':'pipes-rs';
-document.querySelector('#winner').textContent=w; document.querySelector('#runtimeDelta').textContent=fmt((A[other].elapsed_s/A[w].elapsed_s-1)*100,1)+'% less wall time';
-document.querySelector('#fps').textContent=fmt(Math.max(p.fps,d.fps)); document.querySelector('#correctness').textContent=(p.detections===d.detections&&p.points===d.points)?'MATCH':'CHECK';
+const p=A['pipes-rs'],d=A.dora,sameWork=p.submitted===d.submitted&&p.delivered===d.delivered&&p.dropped===d.dropped,
+valid=p.accounting_valid===1&&d.accounting_valid===1&&sameWork,w=lower(p.elapsed_s,d.elapsed_s),other=w==='pipes-rs'?'dora':'pipes-rs';
+document.querySelector('#winner').textContent=valid?w:'INVALID'; document.querySelector('#runtimeDelta').textContent=valid?(fmt((1-A[w].elapsed_s/A[other].elapsed_s)*100,1)+'% less wall time'):'work/accounting mismatch';
+document.querySelector('#fps').textContent=valid?fmt(Math.max(p.fps,d.fps)):'—'; document.querySelector('#correctness').textContent=(valid&&p.detections===d.detections&&p.points===d.points)?'MATCH':'CHECK';
 function bars(id,items){{const max=Math.max(...items.map(x=>x[2]));document.querySelector(id).innerHTML=items.map(([label,n,v])=>`<div class="bar-row"><span>${{label}}</span><div class="track"><div class="fill ${{colors[n]}}" style="width:${{100*v/max}}%"></div></div><b>${{fmt(v)}}</b></div>`).join('')}}
 bars('#runtimeBars',data.runs.map(r=>[r.run_id,r.framework,r.elapsed_s]));
 document.querySelector('#variance').innerHTML=names.map(n=>`<p><span class="dot ${{colors[n]}}"></span>${{n}} · ${{fmt(A[n].elapsed_s_stdev)}} s<br><span class="muted">${{A[n].runs}} runs</span></p>`).join('');
 bars('#stageBars',names.flatMap(n=>[['camera '+n,n,A[n].camera_ms],['LiDAR '+n,n,A[n].lidar_ms],['fusion '+n,n,A[n].fusion_ms]]));
 bars('#latencyBars',names.flatMap(n=>[['age p95 '+n,n,A[n].age_p95_ms],['queue p95 '+n,n,A[n].queue_p95_ms]]));
-const rows=[['Runtime (s)','elapsed_s'],['Throughput (FPS)','fps'],['Camera setup (ms)','camera_setup_ms'],['LiDAR setup (ms)','lidar_setup_ms'],['Camera compute (ms)','camera_ms'],['Inference (ms)','inference_ms'],['LiDAR compute (ms)','lidar_ms'],['Fusion (ms)','fusion_ms'],['Queue p50 (ms)','queue_p50_ms'],['Queue p95 (ms)','queue_p95_ms'],['Frame age p50 (ms)','age_p50_ms'],['Frame age p95 (ms)','age_p95_ms'],['CPU time (s)','cpu_s'],['Peak memory (MiB)','memory_peak_mb'],['Precision','precision'],['Recall','recall'],['Dropped','dropped']];
+const rows=[['Runtime (s)','elapsed_s'],['Throughput (FPS)','fps'],['Submitted','submitted'],['Delivered','delivered'],['Dropped','dropped'],['Accounting valid','accounting_valid'],['Camera setup (ms)','camera_setup_ms'],['LiDAR setup (ms)','lidar_setup_ms'],['Camera compute (ms)','camera_ms'],['Inference (ms)','inference_ms'],['LiDAR compute (ms)','lidar_ms'],['Fusion (ms)','fusion_ms'],['Queue p50 (ms)','queue_p50_ms'],['Queue p95 (ms)','queue_p95_ms'],['Frame age p50 (ms)','age_p50_ms'],['Frame age p95 (ms)','age_p95_ms'],['CPU time (s)','cpu_s'],['Peak memory (MiB)','memory_peak_mb'],['Precision','precision'],['Recall','recall']];
 document.querySelector('#ledger').innerHTML='<thead><tr><th>Metric</th>'+names.map(n=>`<th><span class="dot ${{colors[n]}}"></span>${{n}}</th>`).join('')+'</tr></thead><tbody>'+rows.map(([label,key])=>`<tr><td>${{label}}</td>${{names.map(n=>`<td>${{fmt(A[n][key],key==='precision'||key==='recall'?3:2)}}</td>`).join('')}}</tr>`).join('')+'</tbody>';
 </script></body></html>'''
 

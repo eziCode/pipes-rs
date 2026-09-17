@@ -359,6 +359,9 @@ pub fn run_segment_pipeline(
     let mut setup = BufWriter::new(File::create(output.with_extension("setup.txt"))?);
     writeln!(setup, "camera_setup_ns={camera_setup_ns}")?;
     writeln!(setup, "lidar_setup_ns={lidar_setup_ns}")?;
+    writeln!(setup, "submitted={}", summary.frames)?;
+    writeln!(setup, "delivered={}", summary.frames)?;
+    writeln!(setup, "dropped=0")?;
     setup.flush()?;
     summary.elapsed = run_started.elapsed();
     Ok(summary)

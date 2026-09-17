@@ -106,7 +106,7 @@ fn settings() -> (PathBuf, String, String, usize) {
 }
 
 fn camera() -> Result<()> {
-    let (mut node, _events) = DoraNode::init_from_env()?;
+    let (mut node, mut events) = DoraNode::init_from_env()?;
     let setup_started = Instant::now();
     let (root, split, segment, limit) = settings();
     let model = env::var("MODEL_PATH").unwrap_or_else(|_| "models/yolox_nano.onnx".into());
@@ -123,6 +123,8 @@ fn camera() -> Result<()> {
     ))?;
     write_setup("camera_setup_ns", ns(setup_started))?;
     let output = DataId::from("detections".to_owned());
+    let mut submitted = 0usize;
+    let mut acknowledged = 0usize;
     fusion::visit_camera_frames(
         &fusion::component_path(&root, &split, "camera_image", &segment),
         limit,
@@ -169,12 +171,23 @@ fn camera() -> Result<()> {
                 },
             )?;
             node.send_output(output.clone(), MetadataParameters::default(), message)?;
+            submitted += 1;
+            while submitted - acknowledged >= 4 {
+                wait_for_credit(&mut events)?;
+                acknowledged += 1;
+            }
             Ok(())
         },
-    )
+    )?;
+    node.send_output(
+        DataId::from("camera_done".to_owned()),
+        MetadataParameters::default(),
+        UInt64Array::from(vec![submitted as u64]),
+    )?;
+    wait_for_completion(&mut events, submitted)
 }
 fn lidar() -> Result<()> {
-    let (mut node, _events) = DoraNode::init_from_env()?;
+    let (mut node, mut events) = DoraNode::init_from_env()?;
     let setup_started = Instant::now();
     let (root, split, segment, limit) = settings();
     let calibration = fusion::read_calibration(&fusion::component_path(
@@ -190,6 +203,8 @@ fn lidar() -> Result<()> {
     )?;
     write_setup("lidar_setup_ns", ns(setup_started))?;
     let output = DataId::from("pointcloud".to_owned());
+    let mut submitted = 0usize;
+    let mut acknowledged = 0usize;
     fusion::visit_top_lidar_frames(
         &fusion::component_path(&root, &split, "lidar", &segment),
         "[LiDARComponent]",
@@ -213,12 +228,23 @@ fn lidar() -> Result<()> {
                     sent_unix_ns,
                 )?,
             )?;
+            submitted += 1;
+            while submitted - acknowledged >= 4 {
+                wait_for_credit(&mut events)?;
+                acknowledged += 1;
+            }
             Ok(())
         },
-    )
+    )?;
+    node.send_output(
+        DataId::from("lidar_done".to_owned()),
+        MetadataParameters::default(),
+        UInt64Array::from(vec![submitted as u64]),
+    )?;
+    wait_for_completion(&mut events, submitted)
 }
 fn fusion_node() -> Result<()> {
-    let (_node, mut events) = DoraNode::init_from_env()?;
+    let (mut node, mut events) = DoraNode::init_from_env()?;
     let path = env::var("OUTPUT_CSV").unwrap_or_else(|_| "dora-perception.csv".into());
     if let Some(parent) = Path::new(&path)
         .parent()
@@ -235,7 +261,7 @@ fn fusion_node() -> Result<()> {
     let mut cameras = HashMap::new();
     let mut lidars = HashMap::new();
     let mut frame = 0usize;
-    let (mut camera_closed, mut lidar_closed) = (false, false);
+    let (mut camera_submitted, mut lidar_submitted) = (None, None);
     while let Some(event) = events.recv() {
         match event {
             Event::Input { id, data, .. } if id.as_str() == "detections" => {
@@ -246,8 +272,12 @@ fn fusion_node() -> Result<()> {
                 let m = parse_lidar(data.as_array().as_ref())?;
                 lidars.insert(m.timestamp, m);
             }
-            Event::InputClosed { id } if id.as_str() == "detections" => camera_closed = true,
-            Event::InputClosed { id } if id.as_str() == "pointcloud" => lidar_closed = true,
+            Event::Input { id, data, .. } if id.as_str() == "camera_done" => {
+                camera_submitted = Some(signal_count(data.as_array().as_ref())?);
+            }
+            Event::Input { id, data, .. } if id.as_str() == "lidar_done" => {
+                lidar_submitted = Some(signal_count(data.as_array().as_ref())?);
+            }
             Event::Stop(_) => break,
             _ => {}
         }
@@ -291,9 +321,28 @@ fn fusion_node() -> Result<()> {
                 unix_ns().saturating_sub(camera.started_unix_ns.min(lidar.started_unix_ns))
             )?;
             frame += 1;
+            node.send_output(
+                DataId::from("credit".to_owned()),
+                MetadataParameters::default(),
+                UInt64Array::from(vec![frame as u64]),
+            )?;
         }
-        if camera_closed && lidar_closed {
-            break;
+        if let (Some(camera_count), Some(lidar_count)) = (camera_submitted, lidar_submitted) {
+            anyhow::ensure!(
+                camera_count == lidar_count,
+                "source count mismatch: camera={camera_count}, lidar={lidar_count}"
+            );
+            if frame == camera_count && cameras.is_empty() && lidars.is_empty() {
+                node.send_output(
+                    DataId::from("completion".to_owned()),
+                    MetadataParameters::default(),
+                    UInt64Array::from(vec![frame as u64]),
+                )?;
+                write_setup("submitted", frame as u64)?;
+                write_setup("delivered", frame as u64)?;
+                write_setup("dropped", 0)?;
+                break;
+            }
         }
     }
     csv.flush()?;
@@ -303,6 +352,48 @@ fn fusion_node() -> Result<()> {
         frame as f64 / run.elapsed().as_secs_f64().max(f64::EPSILON)
     );
     Ok(())
+}
+
+fn signal_count(data: &dyn Array) -> Result<usize> {
+    let values = data
+        .as_any()
+        .downcast_ref::<UInt64Array>()
+        .context("completion signal is not UInt64Array")?;
+    anyhow::ensure!(!values.is_empty(), "completion signal is empty");
+    Ok(values.value(0) as usize)
+}
+
+fn wait_for_completion(events: &mut dora_node_api::EventStream, submitted: usize) -> Result<()> {
+    while let Some(event) = events.recv() {
+        match event {
+            Event::Input { id, data, .. } if id.as_str() == "completion" => {
+                let delivered = signal_count(data.as_array().as_ref())?;
+                anyhow::ensure!(
+                    delivered == submitted,
+                    "completion mismatch: submitted={submitted}, delivered={delivered}"
+                );
+                return Ok(());
+            }
+            Event::Stop(reason) => anyhow::bail!(
+                "dataflow stopped before completion acknowledgement: {reason:?}"
+            ),
+            _ => {}
+        }
+    }
+    anyhow::bail!("completion input closed before acknowledgement")
+}
+
+fn wait_for_credit(events: &mut dora_node_api::EventStream) -> Result<()> {
+    while let Some(event) = events.recv() {
+        match event {
+            Event::Input { id, .. } if id.as_str() == "credit" => return Ok(()),
+            Event::Stop(reason) => {
+                anyhow::bail!("dataflow stopped while waiting for queue credit: {reason:?}")
+            }
+            _ => {}
+        }
+    }
+    anyhow::bail!("credit input closed before producer finished")
 }
 
 fn camera_sink() -> Result<()> {

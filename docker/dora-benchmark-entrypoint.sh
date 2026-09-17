@@ -29,7 +29,11 @@ fi
 for input in "${inputs[@]}"; do
   [ -r "$input" ] || { echo "missing benchmark input: $input" >&2; exit 2; }
 done
-sha256sum "${inputs[@]}" > "$result_dir/input.sha256"
+if [ "${#inputs[@]}" -gt 0 ]; then
+  sha256sum "${inputs[@]}" > "$result_dir/input.sha256"
+else
+  : > "$result_dir/input.sha256"
+fi
 
 export DATA_ROOT="$data_root" MODEL_PATH="$model"
 export OUTPUT_CSV="$result_dir/perception.csv"
