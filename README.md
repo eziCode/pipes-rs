@@ -308,3 +308,34 @@ For a quick wiring check instead of a performance result:
 FRAME_LIMIT=1 TRANSPORT_FRAMES=3 TRANSPORT_POINTS=1000 \
   ./scripts/run_baseline_matrix.sh smoke-01 1
 ```
+
+## Play and scrub a full Waymo scene
+
+Export every front-camera / top-LiDAR frame through the staged perception
+pipeline, including actual YOLOX inference and depth fusion:
+
+```bash
+cargo run --release -- \
+  --segment 10023947602400723454_1120_000_1140_000 \
+  --onnx-model models/yolox_nano.onnx \
+  --scene-output demo-output/scene
+open demo-output/scene/index.html
+```
+
+The viewer works directly from disk with no server or external dependencies.
+Keep its directory together: the page loads per-frame images and results on
+demand, with a bounded browser cache. Drag or scroll the timeline, use the
+arrow keys to step, or press Space to play. Playback uses source timestamps,
+with speed and loop controls. Camera detections, projected LiDAR, the bird's-eye
+point cloud, object depths, and measured stage timings stay on the same frame.
+Select an object below the pipeline panel to highlight its associated points.
+
+The default exports the entire segment; `--frame-limit 10` makes a short preview.
+Omit `--onnx-model` for an explicitly labeled Waymo ground-truth baseline.
+`perception.csv` in the export directory contains the full run metrics; use
+`--perception-csv PATH` to select another location. The viewer replays computed
+results; it does not run inference in JavaScript. Displayed clouds are sampled
+to at most 18,000 points while fusion uses all points. This is the full temporal
+segment for the front camera and top LiDAR, not a multi-camera surround view.
+The existing vehicle-relative conversion does not apply per-pixel motion
+compensation or object tracking.

@@ -64,6 +64,10 @@ struct Args {
     #[arg(long)]
     demo_output: Option<PathBuf>,
 
+    /// Export the full perception run as a time-scrubbable scene viewer directory.
+    #[arg(long, conflicts_with_all = ["demo_output", "transport_csv"])]
+    scene_output: Option<PathBuf>,
+
     /// Zero-based front-camera frame used by --demo-output.
     #[arg(long, default_value_t = 0)]
     frame_index: usize,
@@ -150,13 +154,22 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
-    if let Some(output) = &args.perception_csv {
+    let scene_csv = args
+        .scene_output
+        .as_ref()
+        .map(|path| path.join("perception.csv"));
+    if let Some(output) = args.perception_csv.as_ref().or(scene_csv.as_ref()) {
+        anyhow::ensure!(
+            args.scene_output.is_none()
+                || matches!(args.perception_component, PerceptionComponent::Full),
+            "--scene-output requires the full perception pipeline"
+        );
         anyhow::ensure!(
             args.stage_queue_size > 0,
             "--stage-queue-size must be at least 1"
         );
         let summary = match args.perception_component {
-            PerceptionComponent::Full => fusion::run_segment_pipeline(
+            PerceptionComponent::Full => fusion::run_segment_pipeline_export(
                 &args.data_root,
                 &args.split,
                 &args.segment,
@@ -169,6 +182,7 @@ fn main() -> Result<()> {
                     fusion_work_ms: args.fusion_work_ms,
                 },
                 output,
+                args.scene_output.as_deref(),
             )?,
             PerceptionComponent::Camera => fusion::run_camera_only(
                 &args.data_root,

@@ -106,6 +106,7 @@ pub struct PerceptionConfig<'a> {
 }
 
 struct CameraOutput {
+    jpeg: Vec<u8>,
     timestamp: i64,
     image_width: u32,
     image_height: u32,
@@ -150,6 +151,21 @@ pub fn run_segment_pipeline(
     config: PerceptionConfig<'_>,
     output: &Path,
 ) -> Result<PerceptionSummary> {
+    run_segment_pipeline_export(root, split, segment, config, output, None)
+}
+
+pub fn run_segment_pipeline_export(
+    root: &Path,
+    split: &str,
+    segment: &str,
+    config: PerceptionConfig<'_>,
+    output: &Path,
+    scene_output: Option<&Path>,
+) -> Result<PerceptionSummary> {
+    let mut scene = scene_output
+        .map(|path| crate::scene::SceneWriter::new(path, segment, config.onnx_model.is_some()))
+        .transpose()?;
+    let export_scene = scene.is_some();
     let PerceptionConfig {
         frame_limit,
         queue_size,
@@ -213,6 +229,7 @@ pub fn run_segment_pipeline(
                     .unwrap_or(0);
                 let detection_batch = detection_batch(&detections)?;
                 let output = CameraOutput {
+                    jpeg: if export_scene { frame.jpeg } else { Vec::new() },
                     timestamp: frame.timestamp,
                     image_width: rgb.width(),
                     image_height: rgb.height(),
@@ -341,6 +358,26 @@ pub fn run_segment_pipeline(
             fusion_ns,
             elapsed_ns(first_started),
         )?;
+        if let Some(scene) = scene.as_mut() {
+            scene.frame(
+                camera.timestamp,
+                &camera.jpeg,
+                camera.image_width,
+                camera.image_height,
+                &lidar.cloud.points,
+                &camera.detections,
+                [
+                    camera.stage_ns,
+                    camera.inference_ns,
+                    lidar.stage_ns,
+                    camera_wait,
+                    lidar_wait,
+                    skew_ns,
+                    fusion_ns,
+                    elapsed_ns(first_started),
+                ],
+            )?;
+        }
         summary.frames += 1;
         summary.points += lidar.cloud.batch.num_rows();
         summary.detections += camera.detection_batch.num_rows();
@@ -363,6 +400,9 @@ pub fn run_segment_pipeline(
     writeln!(setup, "delivered={}", summary.frames)?;
     writeln!(setup, "dropped=0")?;
     setup.flush()?;
+    if let Some(scene) = scene {
+        scene.finish()?;
+    }
     summary.elapsed = run_started.elapsed();
     Ok(summary)
 }
