@@ -13,6 +13,7 @@ use dora_node_api::{DoraNode, Event, MetadataParameters};
 use pipes_rs::{
     detector::YoloxDetector,
     fusion::{self, Detection, Point},
+    pilot::{self, monotonic_ns},
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -22,7 +23,7 @@ use std::{
     io::{BufWriter, Write},
     path::{Path, PathBuf},
     sync::Arc,
-    time::{Instant, SystemTime, UNIX_EPOCH},
+    time::Instant,
 };
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -59,15 +60,15 @@ struct CameraMessage {
     width: u32,
     height: u32,
     checksum: u32,
-    started_unix_ns: u64,
-    sent_unix_ns: u64,
+    started_mono_ns: u64,
+    sent_mono_ns: u64,
 }
 struct LidarMessage {
     timestamp: i64,
     points: Vec<Point>,
     stage_ns: u64,
-    started_unix_ns: u64,
-    sent_unix_ns: u64,
+    started_mono_ns: u64,
+    sent_mono_ns: u64,
 }
 struct CameraArrayMeta {
     timestamp: i64,
@@ -76,8 +77,8 @@ struct CameraArrayMeta {
     width: u32,
     height: u32,
     checksum: u32,
-    started_unix_ns: u64,
-    sent_unix_ns: u64,
+    started_mono_ns: u64,
+    sent_mono_ns: u64,
 }
 
 fn main() -> Result<()> {
@@ -129,8 +130,8 @@ fn camera() -> Result<()> {
         &fusion::component_path(&root, &split, "camera_image", &segment),
         limit,
         |frame| {
+            let started_mono_ns = monotonic_ns();
             let started = Instant::now();
-            let started_unix_ns = unix_ns();
             let image = image::load_from_memory(&frame.jpeg)?;
             let rgb = image.to_rgb8();
             let mut checksum = crc32fast::Hasher::new();
@@ -155,7 +156,7 @@ fn camera() -> Result<()> {
                 .get(&frame.timestamp)
                 .map(|v| v.iter().map(WireDetection::from).collect::<Vec<_>>())
                 .unwrap_or_default();
-            let sent_unix_ns = unix_ns();
+            let sent_mono_ns = monotonic_ns();
             let message = camera_array(
                 &predictions,
                 &truth,
@@ -166,8 +167,8 @@ fn camera() -> Result<()> {
                     width: rgb.width(),
                     height: rgb.height(),
                     checksum: checksum.finalize(),
-                    started_unix_ns,
-                    sent_unix_ns,
+                    started_mono_ns,
+                    sent_mono_ns,
                 },
             )?;
             node.send_output(output.clone(), MetadataParameters::default(), message)?;
@@ -210,13 +211,13 @@ fn lidar() -> Result<()> {
         "[LiDARComponent]",
         limit,
         |frame| {
+            let started_mono_ns = monotonic_ns();
             let started = Instant::now();
-            let started_unix_ns = unix_ns();
             let projection = projections
                 .get(&frame.timestamp)
                 .context("missing LiDAR camera projection")?;
             let cloud = fusion::convert_top_lidar(&frame, projection, &calibration)?;
-            let sent_unix_ns = unix_ns();
+            let sent_mono_ns = monotonic_ns();
             node.send_output(
                 output.clone(),
                 MetadataParameters::default(),
@@ -224,8 +225,8 @@ fn lidar() -> Result<()> {
                     frame.timestamp,
                     &cloud.points,
                     ns(started),
-                    started_unix_ns,
-                    sent_unix_ns,
+                    started_mono_ns,
+                    sent_mono_ns,
                 )?,
             )?;
             submitted += 1;
@@ -253,10 +254,9 @@ fn fusion_node() -> Result<()> {
         std::fs::create_dir_all(parent)?;
     }
     let mut csv = BufWriter::new(File::create(&path)?);
-    writeln!(
-        csv,
-        "frame,timestamp_micros,status,camera_width,camera_height,camera_checksum,points,detections,ground_truth,true_positives,false_positives,false_negatives,depth_matched,camera_stage_ns,inference_ns,lidar_stage_ns,camera_queue_wait_ns,lidar_queue_wait_ns,sync_skew_ns,fusion_ns,end_to_end_ns"
-    )?;
+    writeln!(csv, "{}", pilot::HEADER)?;
+    let mut validation = pilot::Validation::new(Path::new(&path))?;
+    let mut completed = false;
     let run = Instant::now();
     let mut cameras = HashMap::new();
     let mut lidars = HashMap::new();
@@ -266,11 +266,19 @@ fn fusion_node() -> Result<()> {
         match event {
             Event::Input { id, data, .. } if id.as_str() == "detections" => {
                 let m = parse_camera(data.as_array().as_ref())?;
-                cameras.insert(m.timestamp, m);
+                let received = monotonic_ns();
+                anyhow::ensure!(
+                    cameras.insert(m.timestamp, (m, received)).is_none(),
+                    "duplicate camera timestamp"
+                );
             }
             Event::Input { id, data, .. } if id.as_str() == "pointcloud" => {
                 let m = parse_lidar(data.as_array().as_ref())?;
-                lidars.insert(m.timestamp, m);
+                let received = monotonic_ns();
+                anyhow::ensure!(
+                    lidars.insert(m.timestamp, (m, received)).is_none(),
+                    "duplicate LiDAR timestamp"
+                );
             }
             Event::Input { id, data, .. } if id.as_str() == "camera_done" => {
                 camera_submitted = Some(signal_count(data.as_array().as_ref())?);
@@ -287,9 +295,12 @@ fn fusion_node() -> Result<()> {
             .copied()
             .collect();
         for timestamp in ready {
-            let camera = cameras.remove(&timestamp).unwrap();
-            let lidar = lidars.remove(&timestamp).unwrap();
-            let received_unix_ns = unix_ns();
+            let (camera, camera_received) = cameras.remove(&timestamp).unwrap();
+            let (lidar, lidar_received) = lidars.remove(&timestamp).unwrap();
+            let pair_ready = monotonic_ns();
+            let mut predicted: Vec<Detection> =
+                camera.predictions.iter().map(Detection::from).collect();
+            let truth: Vec<Detection> = camera.truth.iter().map(Detection::from).collect();
             let fuse = Instant::now();
             if let Ok(ms) = env::var("FUSION_WORK_MS")
                 .unwrap_or_default()
@@ -297,13 +308,23 @@ fn fusion_node() -> Result<()> {
             {
                 std::thread::sleep(std::time::Duration::from_millis(ms));
             }
-            let mut predicted: Vec<Detection> =
-                camera.predictions.iter().map(Detection::from).collect();
-            let truth: Vec<Detection> = camera.truth.iter().map(Detection::from).collect();
             fusion::add_depths(&mut predicted, &lidar.points);
+            let fusion_ns = ns(fuse);
+            let fusion_finished = monotonic_ns();
+            let timing = pilot::Timing {
+                camera_started: camera.started_mono_ns,
+                lidar_started: lidar.started_mono_ns,
+                camera_sent: camera.sent_mono_ns,
+                lidar_sent: lidar.sent_mono_ns,
+                camera_received,
+                lidar_received,
+                pair_ready,
+                fusion_finished,
+            };
+            timing.validate()?;
             let (tp, fp, fn_) = fusion::evaluate_detections(&predicted, &truth, 0.5);
             let depth = predicted.iter().filter(|d| d.depth_m.is_some()).count();
-            writeln!(
+            write!(
                 csv,
                 "{frame},{timestamp},delivered,{},{},{:08x},{},{},{},{tp},{fp},{fn_},{depth},{},{},{},{},{},0,{},{}",
                 camera.width,
@@ -315,11 +336,13 @@ fn fusion_node() -> Result<()> {
                 camera.stage_ns,
                 camera.inference_ns,
                 lidar.stage_ns,
-                received_unix_ns.saturating_sub(camera.sent_unix_ns),
-                received_unix_ns.saturating_sub(lidar.sent_unix_ns),
-                ns(fuse),
-                unix_ns().saturating_sub(camera.started_unix_ns.min(lidar.started_unix_ns))
+                camera_received - camera.sent_mono_ns,
+                lidar_received - lidar.sent_mono_ns,
+                fusion_ns,
+                timing.age()
             )?;
+            timing.write_suffix(&mut csv)?;
+            validation.write(timestamp, &lidar.points, &predicted)?;
             frame += 1;
             node.send_output(
                 DataId::from("credit".to_owned()),
@@ -341,10 +364,16 @@ fn fusion_node() -> Result<()> {
                 write_setup("submitted", frame as u64)?;
                 write_setup("delivered", frame as u64)?;
                 write_setup("dropped", 0)?;
+                completed = true;
                 break;
             }
         }
     }
+    anyhow::ensure!(
+        completed,
+        "Dora stopped without complete source/delivery accounting"
+    );
+    validation.flush()?;
     csv.flush()?;
     println!(
         "dora perception: frames={frame} elapsed={:.2}s rate={:.2}Hz metrics={path}",
@@ -374,9 +403,9 @@ fn wait_for_completion(events: &mut dora_node_api::EventStream, submitted: usize
                 );
                 return Ok(());
             }
-            Event::Stop(reason) => anyhow::bail!(
-                "dataflow stopped before completion acknowledgement: {reason:?}"
-            ),
+            Event::Stop(reason) => {
+                anyhow::bail!("dataflow stopped before completion acknowledgement: {reason:?}")
+            }
             _ => {}
         }
     }
@@ -403,7 +432,7 @@ fn camera_sink() -> Result<()> {
     while let Some(event) = events.recv() {
         match event {
             Event::Input { data, .. } => {
-                let received = unix_ns();
+                let received = monotonic_ns();
                 let camera = parse_camera(data.as_array().as_ref())?;
                 let predicted: Vec<Detection> =
                     camera.predictions.iter().map(Detection::from).collect();
@@ -420,8 +449,8 @@ fn camera_sink() -> Result<()> {
                     truth.len(),
                     camera.stage_ns,
                     camera.inference_ns,
-                    received.saturating_sub(camera.sent_unix_ns),
-                    unix_ns().saturating_sub(camera.started_unix_ns)
+                    received.saturating_sub(camera.sent_mono_ns),
+                    monotonic_ns().saturating_sub(camera.started_mono_ns)
                 )?;
                 frame += 1;
             }
@@ -441,7 +470,7 @@ fn lidar_sink() -> Result<()> {
     while let Some(event) = events.recv() {
         match event {
             Event::Input { data, .. } => {
-                let received = unix_ns();
+                let received = monotonic_ns();
                 let lidar = parse_lidar(data.as_array().as_ref())?;
                 writeln!(
                     csv,
@@ -449,8 +478,8 @@ fn lidar_sink() -> Result<()> {
                     lidar.timestamp,
                     lidar.points.len(),
                     lidar.stage_ns,
-                    received.saturating_sub(lidar.sent_unix_ns),
-                    unix_ns().saturating_sub(lidar.started_unix_ns)
+                    received.saturating_sub(lidar.sent_mono_ns),
+                    monotonic_ns().saturating_sub(lidar.started_mono_ns)
                 )?;
                 frame += 1;
             }
@@ -480,19 +509,19 @@ fn transport_source() -> Result<()> {
     let base = transport_columns(points);
     let output = DataId::from("payload".to_owned());
     for sequence in 0..frames {
-        let started = unix_ns();
-        let sent = unix_ns();
+        let started = monotonic_ns();
+        let sent = monotonic_ns();
         let mut columns = base.clone();
         columns.push((
             "sequence".into(),
             Arc::new(UInt64Array::from(vec![sequence as u64])),
         ));
         columns.push((
-            "started_unix_ns".into(),
+            "started_mono_ns".into(),
             Arc::new(UInt64Array::from(vec![started])),
         ));
         columns.push((
-            "sent_unix_ns".into(),
+            "sent_mono_ns".into(),
             Arc::new(UInt64Array::from(vec![sent])),
         ));
         node.send_output(
@@ -515,15 +544,15 @@ fn transport_sink() -> Result<()> {
     while let Some(event) = events.recv() {
         match event {
             Event::Input { data, .. } => {
-                let received = unix_ns();
+                let received = monotonic_ns();
                 let array = data.as_array();
                 let value = array
                     .as_any()
                     .downcast_ref::<StructArray>()
                     .context("transport message is not StructArray")?;
                 let sequence = u64_col(value, "sequence")?;
-                let started = u64_col(value, "started_unix_ns")?;
-                let sent = u64_col(value, "sent_unix_ns")?;
+                let started = u64_col(value, "started_mono_ns")?;
+                let sent = u64_col(value, "sent_mono_ns")?;
                 let points = value
                     .column_by_name("x")
                     .and_then(|a| a.as_any().downcast_ref::<ListArray>())
@@ -534,7 +563,7 @@ fn transport_sink() -> Result<()> {
                     "{sequence},delivered,{points},{},{},{}",
                     points as usize * 33,
                     received.saturating_sub(sent),
-                    unix_ns().saturating_sub(started)
+                    monotonic_ns().saturating_sub(started)
                 )?;
             }
             Event::InputClosed { .. } | Event::Stop(_) => break,
@@ -614,12 +643,12 @@ fn camera_array(
         ("height", Arc::new(UInt32Array::from(vec![meta.height]))),
         ("checksum", Arc::new(UInt32Array::from(vec![meta.checksum]))),
         (
-            "started_unix_ns",
-            Arc::new(UInt64Array::from(vec![meta.started_unix_ns])),
+            "started_mono_ns",
+            Arc::new(UInt64Array::from(vec![meta.started_mono_ns])),
         ),
         (
-            "sent_unix_ns",
-            Arc::new(UInt64Array::from(vec![meta.sent_unix_ns])),
+            "sent_mono_ns",
+            Arc::new(UInt64Array::from(vec![meta.sent_mono_ns])),
         ),
     ])
 }
@@ -627,8 +656,8 @@ fn lidar_array(
     timestamp: i64,
     points: &[Point],
     stage: u64,
-    started_unix_ns: u64,
-    sent_unix_ns: u64,
+    started_mono_ns: u64,
+    sent_mono_ns: u64,
 ) -> Result<StructArray> {
     let list = |name: &str, values: Vec<f32>| {
         (
@@ -665,12 +694,12 @@ fn lidar_array(
         list("v", points.iter().map(|p| p.v).collect()),
         ("stage_ns".into(), Arc::new(UInt64Array::from(vec![stage]))),
         (
-            "started_unix_ns".into(),
-            Arc::new(UInt64Array::from(vec![started_unix_ns])),
+            "started_mono_ns".into(),
+            Arc::new(UInt64Array::from(vec![started_mono_ns])),
         ),
         (
-            "sent_unix_ns".into(),
-            Arc::new(UInt64Array::from(vec![sent_unix_ns])),
+            "sent_mono_ns".into(),
+            Arc::new(UInt64Array::from(vec![sent_mono_ns])),
         ),
     ])
 }
@@ -704,8 +733,8 @@ fn parse_camera(data: &dyn Array) -> Result<CameraMessage> {
         width: u32_col(s, "width")?,
         height: u32_col(s, "height")?,
         checksum: u32_col(s, "checksum")?,
-        started_unix_ns: u64_col(s, "started_unix_ns")?,
-        sent_unix_ns: u64_col(s, "sent_unix_ns")?,
+        started_mono_ns: u64_col(s, "started_mono_ns")?,
+        sent_mono_ns: u64_col(s, "sent_mono_ns")?,
     })
 }
 fn parse_lidar(data: &dyn Array) -> Result<LidarMessage> {
@@ -739,8 +768,8 @@ fn parse_lidar(data: &dyn Array) -> Result<LidarMessage> {
         timestamp: i64_col(s, "timestamp")?,
         points,
         stage_ns: u64_col(s, "stage_ns")?,
-        started_unix_ns: u64_col(s, "started_unix_ns")?,
-        sent_unix_ns: u64_col(s, "sent_unix_ns")?,
+        started_mono_ns: u64_col(s, "started_mono_ns")?,
+        sent_mono_ns: u64_col(s, "sent_mono_ns")?,
     })
 }
 fn i64_col(s: &StructArray, n: &str) -> Result<i64> {
@@ -805,13 +834,6 @@ fn i8_list_col(s: &StructArray, n: &str) -> Result<Vec<i8>> {
 }
 fn ns(start: Instant) -> u64 {
     start.elapsed().as_nanos().min(u64::MAX as u128) as u64
-}
-fn unix_ns() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos()
-        .min(u64::MAX as u128) as u64
 }
 fn write_setup(name: &str, value: u64) -> Result<()> {
     if let Ok(dir) = env::var("OUTPUT_DIR") {

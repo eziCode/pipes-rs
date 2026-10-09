@@ -1,7 +1,10 @@
+pub mod execution_experiment;
+pub mod arrow_experiment;
 pub mod detector;
 pub mod fusion;
 pub mod measurement;
 pub mod metrics;
+pub mod pilot;
 pub mod queue;
 pub mod replay;
 pub mod scene;

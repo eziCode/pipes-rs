@@ -59,6 +59,40 @@ but neither project depends on the other.
 
 ## Download a small Waymo sample
 
+On PACE, the project-root Bash scripts request one RTX 6000 GPU with the
+`embers` QoS and account `gts-agarg35`, with logs in
+`/storage/home/hcoda1/7/eakresh3/slurm_out`:
+
+```bash
+cd /storage/home/hcoda1/7/eakresh3/Documents/pipes-rs
+mkdir -p /storage/home/hcoda1/7/eakresh3/slurm_out
+bash download_waymo.sh --dry-run
+sbatch download_waymo.sh
+sbatch download_yolox.sh
+```
+
+Before submitting the Waymo job, install the Google Cloud CLI and authenticate
+with `gcloud auth login` using the account that accepted the Waymo terms. The
+wrapper also searches `~/google-cloud-sdk/bin` and `~/.local/bin` for the CLI.
+The jobs require outbound network access from their assigned compute nodes.
+Neither download requires Rust. The GPU request places these jobs on GPU
+nodes; the downloads themselves use CPU and network resources.
+
+`download_waymo.sh` defaults to both sample segments with labels in
+`~/scratch/pipes-rs/data/waymo-v2-sample/`; pass `--count 1` for just the first segment, or any
+other Python downloader options. `download_yolox.sh` saves the checksum-verified
+model to `~/scratch/pipes-rs/models/yolox_nano.onnx`. Both wrappers can also run with `bash`.
+They use an explicit project path because Slurm spools submitted scripts;
+set `PIPES_ROOT` if the checkout moves. Re-running skips existing Waymo objects
+and verifies an existing YOLOX model before reusing it.
+
+For native perception runs with this scratch download, pass
+`--data-root "$HOME/scratch/pipes-rs/data/waymo-v2-sample"` and, for inference,
+`--onnx-model "$HOME/scratch/pipes-rs/models/yolox_nano.onnx"`.
+The container benchmark scripts still mount `data/waymo-v2-sample` and `models`
+inside the checkout; point those paths at the scratch directories before
+using those scripts.
+
 The sample downloader fetches the camera and LiDAR components for one or two
 20-second Waymo Open Dataset v2 segments. Accept the
 [Waymo Open Dataset terms](https://waymo.com/open/terms/), authenticate with
@@ -256,6 +290,62 @@ cargo install dora-cli --version 1.0.1 --locked
 
 ## Normalized pipes-rs × Dora baseline
 
+### PACE: both complete Waymo segments
+
+The native Slurm runner uses the downloaded dataset and model under
+`~/scratch/pipes-rs`, without Docker:
+
+```bash
+bash benchmark_waymo.sh --dry-run
+sbatch benchmark_waymo.sh
+```
+
+It requests an RTX 6000 node with `embers`, four CPU cores, and 24 GB memory.
+Both implementations currently use CPU ONNX inference, even on a GPU node.
+The first job installs Rust 1.95.0 and Dora CLI 1.0.1 into scratch storage and
+builds both implementations with their lockfiles. It needs outbound network
+access for that setup. Subsequent jobs reuse compiler and crate caches.
+Both link against the same checksum-pinned ONNX Runtime 1.27.0 CPU library
+extracted from Microsoft's manylinux wheel. The runner checks that the host
+can load API 27 before building; this avoids the newer glibc requirement of
+the default static runtime archive. No Python environment is changed.
+
+By default, every segment in the download manifest runs in full five times
+per framework: two downloaded segments produce 20 measured runs. The runner
+first runs a separate detailed validation pass over the same frames for each
+framework, alternates order between timed repeats, and hashes the same inputs
+before each run. Validation compares detection values and point-field
+fingerprints as well as timestamps, RGB checksums, and counts. Timed runs
+check event ordering, delivery accounting, and bounded processing concurrency.
+A mismatch or failed process stops the job. This increases
+frame coverage to two full segments; repeats measure variance, not additional
+unique data. To choose a different size, use:
+
+```bash
+sbatch benchmark_waymo.sh --repeats 3 --frame-limit 100
+```
+
+For the initial pilot, use `--repeats 2 --frame-limit 20 --warmup-frames 5`.
+Both frameworks use a same-host monotonic clock and at most four outstanding
+frames per source. Each timed process excludes its first five source frames
+from steady-state summaries; complete raw rows and whole-process timings are
+retained. See [the metric contract](docs/pilot-metric-contract.md) for exact
+timer boundaries, validation tolerances, and interpretation limits.
+
+Logs go to `~/slurm_out/PipesDoraWaymo-JOBID.out`. Sources, executable hashes,
+environment information, raw CSVs, and a report covering both segments
+go to `~/scratch/pipes-rs/benchmark-results/job-JOBID/`. See
+`runs/comparison.json` for frame counts and correctness checks, and
+`runs/pilot-report.html` for the report. Compilation and detailed validation
+passes are excluded from measured runs.
+Native timings include process startup/shutdown. Memory is GNU time maximum
+RSS, not the aggregate simultaneous memory of all Dora processes. These
+results should be compared within this job, not against earlier Docker runs
+with different resource limits. This runner covers the full perception
+workload; the Docker matrix below also isolates camera, LiDAR, and transport.
+
+### Docker matrix
+
 The normalized benchmark makes both implementations decode the same camera
 JPEGs, convert the image to RGB, calculate the same CRC32 checksum, run the
 same YOLOX model, and transport the same nine LiDAR point fields. Full and
@@ -339,3 +429,19 @@ to at most 18,000 points while fusion uses all points. This is the full temporal
 segment for the front camera and top LiDAR, not a multi-camera surround view.
 The existing vehicle-relative conversion does not apply per-pixel motion
 compensation or object tracking.
+
+## Arrow representation experiment
+
+Run `sbatch benchmark_arrow.sh` for a separate CPU depth-association pilot on a GPU allocation. It compares native point objects, native columns, and direct Arrow access, including conversion costs. See [the experiment contract](docs/arrow-experiment.md) for timing boundaries and limitations. Results go to `~/scratch/pipes-rs/arrow-results/job-JOBID/`.
+
+## Composed ROS 2 execution pilot
+
+Run `sbatch benchmark_ros2.sh` to bootstrap ROS 2 Jazzy in scratch and compare native Rust channels with a composed in-process ROS graph calling the same Rust fusion kernel. This initial reference-handoff experiment uses prepared Waymo inputs, not the full perception pipeline. See [scope and measurement contract](docs/ros2-execution-experiment.md).
+
+## Arrow hardware-counter profile
+
+Run `sbatch profile_arrow_memory.sh` to measure supported per-thread hardware counters around prebuilt fusion. Results go to `~/scratch/pipes-rs/arrow-memory-results/job-JOBID/`. Cache-access counts are not DRAM-byte measurements; see [measurement scope](docs/arrow-memory-profile.md).
+
+## Downloadable Waymo scene replay
+
+Run `sbatch export_waymo_scene.sh` to export an entire downloaded segment with offline YOLOX predictions, LiDAR depth association, and a synchronized HTML viewer. Download `~/scratch/pipes-rs/scene-exports/job-JOBID/waymo-scene.zip`, extract it, and open `waymo-scene/index.html`. It supports playback, a draggable timeline, wheel scrubbing, overlays, and detection selection without a server or internet access. See [export details](docs/scene-player.md).

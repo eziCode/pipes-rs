@@ -1,0 +1,14 @@
+# Resolved package versions are exported by each bootstrap job.
+name: pipes-ros2-jazzy
+channels:
+  - robostack-jazzy
+  - conda-forge
+dependencies:
+  - ros-jazzy-rclcpp
+  - ros-jazzy-std-msgs
+  - ros-jazzy-ament-cmake
+  - ros-jazzy-rmw-cyclonedds-cpp
+  - cmake
+  - ninja
+  - cxx-compiler
+  - python

@@ -6,6 +6,7 @@
 /pipeline-metrics.csv
 /benchmark-results/
 /demo-output/
+/docs/
 /models/
 
 # Python tooling

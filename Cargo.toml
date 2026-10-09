@@ -1,9 +1,13 @@
 [package]
 name = "pipes-rs"
+default-run = "pipes-rs"
 version = "0.1.0"
 edition = "2024"
 license = "Apache-2.0"
 description = "Instrumented Apache Arrow sensor pipeline"
+
+[lib]
+crate-type = ["rlib", "cdylib"]
 
 [dependencies]
 anyhow = "1"
@@ -12,6 +16,7 @@ base64 = "0.22"
 clap = { version = "4", features = ["derive"] }
 crc32fast = "1"
 image = { version = "0.25", default-features = false, features = ["jpeg"] }
+libc = "0.2"
 ort = "=2.0.0-rc.13"
 parquet = { version = "59", features = ["arrow"] }
 serde = { version = "1", features = ["derive"] }

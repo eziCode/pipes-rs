@@ -9,6 +9,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use crate::pilot::{self, monotonic_ns};
 use anyhow::{Context, Result, bail};
 use arrow::{
     array::{
@@ -116,16 +117,16 @@ struct CameraOutput {
     ground_truth: Vec<Detection>,
     inference_ns: u64,
     stage_ns: u64,
-    started: Instant,
-    enqueued: Instant,
+    started: u64,
+    enqueued: u64,
 }
 
 struct LidarOutput {
     timestamp: i64,
     cloud: PointCloud,
     stage_ns: u64,
-    started: Instant,
-    enqueued: Instant,
+    started: u64,
+    enqueued: u64,
 }
 
 #[derive(Serialize)]
@@ -177,13 +178,16 @@ pub fn run_segment_pipeline_export(
     let run_started = Instant::now();
     let (camera_tx, camera_rx) = sync_channel(queue_size);
     let (lidar_tx, lidar_rx) = sync_channel(queue_size);
+    anyhow::ensure!(queue_size > 0, "queue size must be positive");
+    let (camera_ack, camera_credit) = std::sync::mpsc::channel();
+    let (lidar_ack, lidar_credit) = std::sync::mpsc::channel();
 
     let camera_path = component_path(root, split, "camera_image", segment);
     let camera_boxes_path = component_path(root, split, "camera_box", segment);
     let model_path = onnx_model.map(Path::to_path_buf);
     let camera_worker = thread::Builder::new()
         .name("camera-decode".to_owned())
-        .spawn(move || -> Result<u64> {
+        .spawn(move || -> Result<(u64, usize)> {
             let setup_started = Instant::now();
             let mut detector = model_path
                 .as_deref()
@@ -191,7 +195,9 @@ pub fn run_segment_pipeline_export(
                 .transpose()?;
             let camera_boxes = read_all_boxes(&camera_boxes_path)?;
             let setup_ns = elapsed_ns(setup_started);
+            let mut submitted = 0usize;
             visit_camera_frames(&camera_path, frame_limit, |frame| {
+                let started_ns = monotonic_ns();
                 let started = Instant::now();
                 let decoded = image::load_from_memory(&frame.jpeg)
                     .context("failed to decode a Waymo camera JPEG")?;
@@ -227,6 +233,8 @@ pub fn run_segment_pipeline_export(
                     .as_ref()
                     .map(|_| elapsed_ns(inference_started))
                     .unwrap_or(0);
+                let stage_ns = elapsed_ns(started);
+                let enqueued = monotonic_ns();
                 let detection_batch = detection_batch(&detections)?;
                 let output = CameraOutput {
                     jpeg: if export_scene { frame.jpeg } else { Vec::new() },
@@ -238,15 +246,22 @@ pub fn run_segment_pipeline_export(
                     detection_batch,
                     ground_truth,
                     inference_ns,
-                    stage_ns: elapsed_ns(started),
-                    started,
-                    enqueued: Instant::now(),
+                    stage_ns,
+                    started: started_ns,
+                    enqueued,
                 };
                 camera_tx
                     .send(output)
-                    .map_err(|_| anyhow::anyhow!("fusion stage closed the camera channel"))
+                    .map_err(|_| anyhow::anyhow!("fusion stage closed the camera channel"))?;
+                submitted += 1;
+                if submitted >= queue_size {
+                    camera_credit
+                        .recv()
+                        .context("camera credit channel closed")?;
+                }
+                Ok(())
             })?;
-            Ok(setup_ns)
+            Ok((setup_ns, submitted))
         })?;
 
     let lidar_path = component_path(root, split, "lidar", segment);
@@ -254,7 +269,7 @@ pub fn run_segment_pipeline_export(
     let calibration_path = component_path(root, split, "lidar_calibration", segment);
     let lidar_worker = thread::Builder::new()
         .name("lidar-arrow".to_owned())
-        .spawn(move || -> Result<u64> {
+        .spawn(move || -> Result<(u64, usize)> {
             let setup_started = Instant::now();
             let calibration = read_calibration(&calibration_path)?;
             let projections = read_all_top_lidar_frames(
@@ -263,7 +278,9 @@ pub fn run_segment_pipeline_export(
                 frame_limit,
             )?;
             let setup_ns = elapsed_ns(setup_started);
+            let mut submitted = 0usize;
             visit_top_lidar_frames(&lidar_path, "[LiDARComponent]", frame_limit, |frame| {
+                let started_ns = monotonic_ns();
                 let started = Instant::now();
                 let projection = projections
                     .get(&frame.timestamp)
@@ -273,14 +290,19 @@ pub fn run_segment_pipeline_export(
                     timestamp: frame.timestamp,
                     cloud,
                     stage_ns: elapsed_ns(started),
-                    started,
-                    enqueued: Instant::now(),
+                    started: started_ns,
+                    enqueued: monotonic_ns(),
                 };
                 lidar_tx
                     .send(output)
-                    .map_err(|_| anyhow::anyhow!("fusion stage closed the LiDAR channel"))
+                    .map_err(|_| anyhow::anyhow!("fusion stage closed the LiDAR channel"))?;
+                submitted += 1;
+                if submitted >= queue_size {
+                    lidar_credit.recv().context("LiDAR credit channel closed")?;
+                }
+                Ok(())
             })?;
-            Ok(setup_ns)
+            Ok((setup_ns, submitted))
         })?;
 
     if let Some(parent) = output
@@ -292,10 +314,8 @@ pub fn run_segment_pipeline_export(
     let mut csv = BufWriter::new(
         File::create(output).with_context(|| format!("failed to create {}", output.display()))?,
     );
-    writeln!(
-        csv,
-        "frame,timestamp_micros,status,camera_width,camera_height,camera_checksum,points,detections,ground_truth,true_positives,false_positives,false_negatives,depth_matched,camera_stage_ns,inference_ns,lidar_stage_ns,camera_queue_wait_ns,lidar_queue_wait_ns,sync_skew_ns,fusion_ns,end_to_end_ns"
-    )?;
+    writeln!(csv, "{}", pilot::HEADER)?;
+    let mut validation = pilot::Validation::new(output)?;
     let mut summary = PerceptionSummary {
         frames: 0,
         points: 0,
@@ -307,12 +327,15 @@ pub fn run_segment_pipeline_export(
         false_negatives: 0,
     };
     while let Ok(mut camera) = camera_rx.recv() {
-        let camera_wait = elapsed_ns(camera.enqueued);
+        let camera_received = monotonic_ns();
         let lidar = lidar_rx
             .recv()
             .context("LiDAR stage ended before the camera stage")?;
-        let lidar_wait = elapsed_ns(lidar.enqueued);
+        let lidar_received = monotonic_ns();
+        let camera_wait = camera_received - camera.enqueued;
+        let lidar_wait = lidar_received - lidar.enqueued;
         let skew_ns = camera.timestamp.abs_diff(lidar.timestamp) * 1_000;
+        let pair_ready = monotonic_ns();
         let fusion_started = Instant::now();
         if fusion_work_ms > 0 {
             thread::sleep(Duration::from_millis(fusion_work_ms));
@@ -321,6 +344,18 @@ pub fn run_segment_pipeline_export(
             add_depths(&mut camera.detections, &lidar.cloud.points);
         }
         let fusion_ns = elapsed_ns(fusion_started);
+        let fusion_finished = monotonic_ns();
+        let timing = pilot::Timing {
+            camera_started: camera.started,
+            lidar_started: lidar.started,
+            camera_sent: camera.enqueued,
+            lidar_sent: lidar.enqueued,
+            camera_received,
+            lidar_received,
+            pair_ready,
+            fusion_finished,
+        };
+        timing.validate()?;
         let (true_positives, false_positives, false_negatives) =
             evaluate_detections(&camera.detections, &camera.ground_truth, 0.5);
         let depth_matched = camera
@@ -328,8 +363,7 @@ pub fn run_segment_pipeline_export(
             .iter()
             .filter(|detection| detection.depth_m.is_some())
             .count();
-        let first_started = camera.started.min(lidar.started);
-        writeln!(
+        write!(
             csv,
             "{},{},{},{},{},{:08x},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
             summary.frames,
@@ -356,8 +390,10 @@ pub fn run_segment_pipeline_export(
             lidar_wait,
             skew_ns,
             fusion_ns,
-            elapsed_ns(first_started),
+            timing.age(),
         )?;
+        timing.write_suffix(&mut csv)?;
+        validation.write(camera.timestamp, &lidar.cloud.points, &camera.detections)?;
         if let Some(scene) = scene.as_mut() {
             scene.frame(
                 camera.timestamp,
@@ -374,10 +410,13 @@ pub fn run_segment_pipeline_export(
                     lidar_wait,
                     skew_ns,
                     fusion_ns,
-                    elapsed_ns(first_started),
+                    timing.age(),
                 ],
             )?;
         }
+        // A credit acknowledges a completed pair, matching the Dora credit protocol.
+        let _ = camera_ack.send(());
+        let _ = lidar_ack.send(());
         summary.frames += 1;
         summary.points += lidar.cloud.batch.num_rows();
         summary.detections += camera.detection_batch.num_rows();
@@ -386,12 +425,17 @@ pub fn run_segment_pipeline_export(
         summary.false_positives += false_positives;
         summary.false_negatives += false_negatives;
     }
-    let camera_setup_ns = camera_worker
+    let (camera_setup_ns, camera_submitted) = camera_worker
         .join()
         .map_err(|_| anyhow::anyhow!("camera stage panicked"))??;
-    let lidar_setup_ns = lidar_worker
+    let (lidar_setup_ns, lidar_submitted) = lidar_worker
         .join()
         .map_err(|_| anyhow::anyhow!("LiDAR stage panicked"))??;
+    anyhow::ensure!(
+        camera_submitted == lidar_submitted && camera_submitted == summary.frames,
+        "source/delivery count mismatch"
+    );
+    validation.flush()?;
     csv.flush()?;
     let mut setup = BufWriter::new(File::create(output.with_extension("setup.txt"))?);
     writeln!(setup, "camera_setup_ns={camera_setup_ns}")?;
@@ -757,6 +801,17 @@ pub fn convert_top_lidar(
     projection: &LidarFrame,
     calibration: &Calibration,
 ) -> Result<PointCloud> {
+    let points = convert_top_lidar_points(lidar, projection, calibration)?;
+    let batch = point_batch(&points)?;
+    Ok(PointCloud { batch, points })
+}
+
+/// Materialize native points without also allocating Arrow columns.
+pub fn convert_top_lidar_points(
+    lidar: &LidarFrame,
+    projection: &LidarFrame,
+    calibration: &Calibration,
+) -> Result<Vec<Point>> {
     let [height, width, channels] = lidar.shape;
     anyhow::ensure!(
         channels >= 4,
@@ -839,11 +894,10 @@ pub fn convert_top_lidar(
             });
         }
     }
-    let batch = point_batch(&points)?;
-    Ok(PointCloud { batch, points })
+    Ok(points)
 }
 
-fn point_batch(points: &[Point]) -> Result<RecordBatch> {
+pub fn point_batch(points: &[Point]) -> Result<RecordBatch> {
     let metadata = HashMap::from([
         ("coordinate_frame".to_owned(), "vehicle".to_owned()),
         ("source".to_owned(), "waymo_top_lidar_return1".to_owned()),
