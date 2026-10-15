@@ -445,3 +445,45 @@ Run `sbatch profile_arrow_memory.sh` to measure supported per-thread hardware co
 ## Downloadable Waymo scene replay
 
 Run `sbatch export_waymo_scene.sh` to export an entire downloaded segment with offline YOLOX predictions, LiDAR depth association, and a synchronized HTML viewer. Download `~/scratch/pipes-rs/scene-exports/job-JOBID/waymo-scene.zip`, extract it, and open `waymo-scene/index.html`. It supports playback, a draggable timeline, wheel scrubbing, overlays, and detection selection without a server or internet access. See [export details](docs/scene-player.md).
+
+## Arrow versus native buffers across Rust and Python
+
+The [Rust–Python experiment](experiments/python-boundary/README.md) uses all five
+cameras, all five LiDARs and both returns in the two existing Waymo segments.
+Rust owns ingestion and buffers; the same Python YOLOX inference and NumPy
+fusion run on shared native arrays, copied native arrays, and Arrow arrays.
+Conversion-inclusive and prepared-buffer conditions are measured separately.
+This experiment is independent of the Pipes-versus-ROS execution pilot.
+
+```bash
+python3 -m venv .venv
+.venv/bin/python -m pip install -r experiments/python-boundary/requirements.txt
+cargo build --release --locked --lib
+.venv/bin/python scripts/run_python_boundary.py \
+  --frames 2 --repeats 1 --warmup 0 \
+  --output benchmark-results/python-boundary/smoke-001
+```
+
+Omit the frame/repeat/warmup options for both complete segments. On PACE, use
+`sbatch benchmark_python_boundary.sh`; see the experiment README for setup,
+measurement boundaries, missing-component checks and validation commands.
+
+Independent sustained runs now have [matching Docker services](compose.python-boundary.yaml):
+
+```bash
+docker compose -f compose.python-boundary.yaml build native
+docker compose -f compose.python-boundary.yaml run --rm prepare
+RUN_ID=throughput-001 docker compose -f compose.python-boundary.yaml up native arrow
+```
+
+Each container progresses independently. Use `RATE=0` for maximum throughput,
+or a positive `RATE` for fixed-rate arrivals and queue buildup.
+See the [experiment instructions](experiments/python-boundary/README.md) for
+conversion-inclusive runs, queue policies, resource limits and recorded metrics.
+
+The [matched producer-copy control](experiments/python-boundary/README.md#matched-producer-copy-experiment)
+adds `native_producer_copy`: Rust copies into native allocations before enqueueing,
+and Python receives zero-copy views. After preparing the updated cache, run
+`python3 scripts/run_producer_copy_experiment.py --name producer-copy-001` for
+five randomized independent trials each of shared native, producer-copied native,
+and conversion-inclusive Arrow, with aggregate comparison tables.

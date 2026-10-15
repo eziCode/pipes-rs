@@ -1,0 +1,68 @@
+# Each benchmark is independent: no dependencies or per-frame barriers.
+x-benchmark: &benchmark
+  image: pipes-python-boundary:local
+  build:
+    context: .
+    dockerfile: Dockerfile.python-boundary
+  cpus: "${BENCHMARK_CPUS:-2.0}"
+  mem_limit: "${BENCHMARK_MEMORY:-4g}"
+  memswap_limit: "${BENCHMARK_MEMORY:-4g}"
+  pids_limit: 128
+  init: true
+  network_mode: none
+  read_only: true
+  tmpfs:
+    - /tmp:size=64m
+  volumes:
+    - ./models:/models:ro
+    - ./data/python-boundary-cache:/cache:ro
+    - ./benchmark-results/python-sustained:/results
+
+services:
+  prepare:
+    <<: *benchmark
+    profiles: [prepare]
+    volumes:
+      - ./models:/models:ro
+      - ./data/waymo-v2-sample:/data/waymo:ro
+      - ./data/python-boundary-cache:/cache
+    command:
+      - --mode=prepare
+      - --data-root=/data/waymo
+      - --output=/cache/${CACHE_ID:-full}
+      - --frames=${FRAME_LIMIT:-0}
+      - --threads=${MODEL_THREADS:-1}
+
+  native:
+    <<: *benchmark
+    # NATIVE_VARIANT=native_producer_copy with CONDITION=conversion_inclusive
+    # copies in Rust on the producer; native_copy instead copies in Python.
+    command:
+      - --mode=sustained
+      - --input-cache=/cache/${CACHE_ID:-full}
+      - --variant=${NATIVE_VARIANT:-native_shared}
+      - --condition=${CONDITION:-prepared}
+      - --output=/results/${RUN_ID:-run-001}/${CONDITION:-prepared}/${NATIVE_VARIANT:-native_shared}
+      - --frames=${FRAME_LIMIT:-0}
+      - --threads=${MODEL_THREADS:-1}
+      - --warmup=${WARMUP:-5}
+      - --rate=${RATE:-0}
+      - --queue-size=${QUEUE_SIZE:-8}
+      - --queue-policy=${QUEUE_POLICY:-backpressure}
+      - --passes=${PASSES:-3}
+
+  arrow:
+    <<: *benchmark
+    command:
+      - --mode=sustained
+      - --input-cache=/cache/${CACHE_ID:-full}
+      - --variant=arrow
+      - --condition=${CONDITION:-prepared}
+      - --output=/results/${RUN_ID:-run-001}/${CONDITION:-prepared}/arrow
+      - --frames=${FRAME_LIMIT:-0}
+      - --threads=${MODEL_THREADS:-1}
+      - --warmup=${WARMUP:-5}
+      - --rate=${RATE:-0}
+      - --queue-size=${QUEUE_SIZE:-8}
+      - --queue-policy=${QUEUE_POLICY:-backpressure}
+      - --passes=${PASSES:-3}

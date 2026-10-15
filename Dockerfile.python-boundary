@@ -1,0 +1,30 @@
+# syntax=docker/dockerfile:1.7
+ARG RUST_IMAGE=rust:1.94.0-trixie@sha256:f17e723020f87c1b4ac4ff6d73c9dfbb7d5cb978754c76641e47337d65f61e12
+ARG RUNTIME_IMAGE=debian:trixie-slim@sha256:d7e12182ce18b85b93007c1dedf31f2d29e01ccf3182cc4017c709b6259bc132
+FROM ${RUST_IMAGE} AS builder
+WORKDIR /build
+COPY Cargo.toml Cargo.lock ./
+COPY src ./src
+COPY assets ./assets
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/build/target \
+    --mount=type=cache,target=/root/.cache/dfbin \
+    cargo clean --release -p ort-sys \
+    && cargo build --locked --release --lib \
+    && cp target/release/libpipes_rs.so /tmp/libpipes_rs.so
+
+FROM ${RUNTIME_IMAGE}
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3 python3-venv libgomp1 ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+WORKDIR /app
+COPY experiments/python-boundary/requirements.txt /app/requirements.txt
+RUN python3 -m venv /opt/venv \
+    && /opt/venv/bin/pip install --no-cache-dir -r /app/requirements.txt \
+    && /opt/venv/bin/pip freeze > /app/installed-packages.txt
+COPY --from=builder /tmp/libpipes_rs.so /app/libpipes_rs.so
+COPY scripts/python_boundary.py scripts/python_perception.py scripts/python_sustained.py scripts/run_python_boundary.py /app/scripts/
+COPY experiments/python-boundary/segments.json /app/experiments/python-boundary/segments.json
+ENV PATH="/opt/venv/bin:$PATH" PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1 \
+    OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1
+ENTRYPOINT ["python", "/app/scripts/run_python_boundary.py", "--library", "/app/libpipes_rs.so", "--model", "/models/yolox_nano.onnx"]

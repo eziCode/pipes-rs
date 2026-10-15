@@ -1,0 +1,16 @@
+**
+!Cargo.toml
+!Cargo.lock
+!src/
+!src/**
+!assets/
+!assets/**
+!scripts/
+!scripts/python_boundary.py
+!scripts/python_perception.py
+!scripts/python_sustained.py
+!scripts/run_python_boundary.py
+!experiments/
+!experiments/python-boundary/
+!experiments/python-boundary/requirements.txt
+!experiments/python-boundary/segments.json

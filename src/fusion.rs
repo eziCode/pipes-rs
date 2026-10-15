@@ -696,7 +696,7 @@ pub fn component_path(root: &Path, split: &str, component: &str, segment: &str) 
         .join(format!("{segment}.parquet"))
 }
 
-fn reader(path: &Path) -> Result<parquet::arrow::arrow_reader::ParquetRecordBatchReader> {
+pub(crate) fn reader(path: &Path) -> Result<parquet::arrow::arrow_reader::ParquetRecordBatchReader> {
     let file = File::open(path).with_context(|| {
         format!(
             "missing {}; rerun scripts/download_waymo_sample.py --with-labels",
@@ -758,11 +758,15 @@ fn read_lidar_frame(path: &Path, target_timestamp: i64, prefix: &str) -> Result<
 }
 
 pub fn read_calibration(path: &Path) -> Result<Calibration> {
+    read_sensor_calibration(path, TOP_LIDAR)
+}
+
+pub(crate) fn read_sensor_calibration(path: &Path, sensor_id: i64) -> Result<Calibration> {
     for batch in reader(path)? {
         let batch = batch?;
         let laser = integer(&batch, "key.laser_name")?;
         for row in 0..batch.num_rows() {
-            if laser(row) != TOP_LIDAR {
+            if laser(row) != sensor_id {
                 continue;
             }
             let transform = fixed_f64(
@@ -793,7 +797,7 @@ pub fn read_calibration(path: &Path) -> Result<Calibration> {
             });
         }
     }
-    bail!("top LiDAR calibration is missing")
+    bail!("LiDAR calibration is missing for sensor {sensor_id}")
 }
 
 pub fn convert_top_lidar(
@@ -1249,7 +1253,7 @@ fn column_index(batch: &RecordBatch, name: &str) -> Result<usize> {
         .with_context(|| format!("missing Arrow column {name}"))
 }
 
-fn int64<'a>(batch: &'a RecordBatch, name: &str) -> Result<&'a Int64Array> {
+pub(crate) fn int64<'a>(batch: &'a RecordBatch, name: &str) -> Result<&'a Int64Array> {
     batch
         .column(column_index(batch, name)?)
         .as_any()
@@ -1265,7 +1269,7 @@ fn float64<'a>(batch: &'a RecordBatch, name: &str) -> Result<&'a Float64Array> {
         .with_context(|| format!("{name} is not Float64"))
 }
 
-fn binary<'a>(batch: &'a RecordBatch, name: &str) -> Result<&'a BinaryArray> {
+pub(crate) fn binary<'a>(batch: &'a RecordBatch, name: &str) -> Result<&'a BinaryArray> {
     batch
         .column(column_index(batch, name)?)
         .as_any()
@@ -1281,7 +1285,7 @@ fn string<'a>(batch: &'a RecordBatch, name: &str) -> Result<&'a StringArray> {
         .with_context(|| format!("{name} is not Utf8"))
 }
 
-fn integer<'a>(batch: &'a RecordBatch, name: &str) -> Result<Box<dyn Fn(usize) -> i64 + 'a>> {
+pub(crate) fn integer<'a>(batch: &'a RecordBatch, name: &str) -> Result<Box<dyn Fn(usize) -> i64 + 'a>> {
     let column = batch.column(column_index(batch, name)?);
     if let Some(array) = column.as_any().downcast_ref::<Int8Array>() {
         return Ok(Box::new(move |row| array.value(row) as i64));
@@ -1296,7 +1300,7 @@ fn float64_scalar(batch: &RecordBatch, name: &str, row: usize) -> Result<f64> {
     Ok(float64(batch, name)?.value(row))
 }
 
-fn list_f32(batch: &RecordBatch, name: &str, row: usize) -> Result<Vec<f32>> {
+pub(crate) fn list_f32(batch: &RecordBatch, name: &str, row: usize) -> Result<Vec<f32>> {
     let list = batch
         .column(column_index(batch, name)?)
         .as_any()
@@ -1324,7 +1328,7 @@ fn list_f64(batch: &RecordBatch, name: &str, row: usize) -> Result<Vec<f64>> {
     Ok(array.values().to_vec())
 }
 
-fn fixed_i32(batch: &RecordBatch, name: &str, row: usize) -> Result<Vec<i32>> {
+pub(crate) fn fixed_i32(batch: &RecordBatch, name: &str, row: usize) -> Result<Vec<i32>> {
     let list = batch
         .column(column_index(batch, name)?)
         .as_any()

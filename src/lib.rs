@@ -10,3 +10,4 @@ pub mod replay;
 pub mod scene;
 pub mod transport;
 pub mod waymo;
+pub mod python_boundary;

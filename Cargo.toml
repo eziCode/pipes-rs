@@ -11,7 +11,7 @@ crate-type = ["rlib", "cdylib"]
 
 [dependencies]
 anyhow = "1"
-arrow = { version = "59", features = ["ipc"] }
+arrow = { version = "59", features = ["ipc", "ffi"] }
 base64 = "0.22"
 clap = { version = "4", features = ["derive"] }
 crc32fast = "1"
